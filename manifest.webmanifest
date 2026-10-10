@@ -1,0 +1,17 @@
+{
+  "name": "箭雨冲冲冲",
+  "short_name": "箭雨冲冲冲",
+  "description": "左右拖动、自动射箭的跑酷小游戏，最后挑战卫衣大魔王。",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "orientation": "portrait",
+  "background_color": "#3d8a3f",
+  "theme_color": "#3d8a3f",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
