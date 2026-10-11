@@ -49,7 +49,7 @@ export function newGame() {
     },
     raft: { x: 0, tiles, anchored: false, sailUp: false },
     inv: { hook: 1, hammer: 1, wood: 4, plastic: 2, rope: 2, cloth: 0, metal: 0, leaf: 0, stone: 0,
-      coconut: 1, raw_fish: 0, cooked_fish: 0, can: 0, water: 1, berry: 0 },
+      coconut: 1, raw_fish: 0, cooked_fish: 0, can: 0, water: 3, berry: 0 },
     codex: {},            // id -> day first seen
     journal: [],          // [{day, text}]
     persist: { islands: {}, flags: {} },  // module-owned saved data (plain JSON only)
