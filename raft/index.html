@@ -1,0 +1,1108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#05070c">
+</head>
+<body>
+<!-- page:start -->
+<title>少年与海</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#05070c;overscroll-behavior:none}
+body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;touch-action:none}
+#game{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;background:#05070c}
+#ui{position:fixed;inset:0;pointer-events:none;z-index:2}
+[hidden]{display:none!important}
+</style>
+<canvas id="game" aria-label="少年与海 游戏画面"></canvas>
+<div id="ui"></div>
+<script>
+(() => {
+  var __defProp = Object.defineProperty;
+  var __export = (target, all) => {
+    for (var name in all)
+      __defProp(target, name, { get: all[name], enumerable: true });
+  };
+
+  // src/data/codex.js
+  var CODEX = {
+    seagull: { name: "跟船的海鸥", kind: "day", desc: "它们总在木筏上空打转，好像知道哪里有鱼。" },
+    flying_fish: { name: "飞鱼群", kind: "day", desc: "一整片银光从浪尖上掠过，像有人往海面撒了一把硬币。" },
+    dolphin: { name: "海豚", kind: "day", desc: "它们陪木筏游了一段路，又笑着离开了。" },
+    turtle: { name: "老海龟", kind: "day", desc: "背壳上长满了藤壶，慢吞吞地，像是已经游了一百年。" },
+    manta: { name: "魔鬼鱼", kind: "day", desc: "巨大的影子从脚下滑过，安静得像一片会飞的云。" },
+    whale: { name: "鲸", kind: "day", desc: "整片海都暗了一下。它从木筏下面经过，比木筏大一百倍。" },
+    shark: { name: "鲨鱼", kind: "day", desc: "灰色的背鳍一直跟着木筏。下水的时候要小心。" },
+    crab: { name: "寄居蟹", kind: "island", desc: "背着别人丢掉的瓶盖当房子。" },
+    jelly: { name: "发光水母", kind: "night", desc: "夜里的海面下亮起一盏盏小灯，碰到会有点疼。" },
+    plankton: { name: "夜光浮游", kind: "night", desc: "划一下水，水就会发出蓝色的光，像把星星搅碎了。" },
+    lanternfish: { name: "灯笼鱼", kind: "night", desc: "它们成群地发着光，绕着提灯打转。" },
+    moon_whale: { name: "月光鲸", kind: "night", desc: "它跃出水面的时候，正好挡住了月亮。" },
+    leviathan: { name: "地平线上的巨影", kind: "night", desc: "远处有什么东西站在海里，比云还高。最好别盯着它看太久。" },
+    ghost_ship: { name: "雾里的船", kind: "night", desc: "起雾的夜里，一艘亮着灯的船从旁边漂过，甲板上一个人也没有。" },
+    angler: { name: "深渊垂钓者", kind: "deep", desc: "黑暗里有一盏小灯在晃。灯后面是一张很大很大的嘴。" },
+    deep_eye: { name: "海底之眼", kind: "deep", desc: "海床上的那块石头，眨了一下眼睛。" },
+    island_beast: { name: "林中野兽", kind: "island", desc: "天黑以后，岛上的树林里有东西在走动。它不喜欢光。" }
+  };
+  var CODEX_IDS = Object.keys(CODEX);
+
+  // src/core/util.js
+  var TAU = Math.PI * 2;
+  var clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+  var smoothstep = (e0, e1, x) => {
+    const t = clamp((x - e0) / (e1 - e0), 0, 1);
+    return t * t * (3 - 2 * t);
+  };
+  var rand = (a, b) => a + Math.random() * (b - a);
+
+  // src/core/state.js
+  var C = {
+    VIEW_H: 540,
+    // world units visible vertically (at least)
+    MIN_VIEW_W: 720,
+    // world units visible horizontally (at least)
+    DAY_LEN: 420,
+    // seconds per full day/night cycle
+    START_PHASE: 0.05,
+    // new game starts just after sunrise
+    SUNSET: 0.56,
+    // phase where the sun touches the horizon
+    NIGHT_START: 0.64,
+    // phase after which it counts as night
+    NIGHT_END: 0.97,
+    // phase before which it is still night
+    TILE_W: 24,
+    // raft tile width (world units)
+    DECK_H: 6,
+    // raft deck height above water line
+    GOAL_X: 2e4,
+    // the lighthouse island sits here
+    DRIFT: 9,
+    // raft drift speed (units/s) without sail
+    SAIL_BOOST: 14,
+    // extra speed with the sail raised
+    GRAVITY: 900,
+    PLAYER_H: 28,
+    // the boy is small; the world is big
+    MAX_STAT: 100
+  };
+  function daylight(phase) {
+    if (phase < 0.06) return 0.18 + 0.82 * smoothstep(0, 0.06, phase);
+    if (phase < 0.52) return 1;
+    if (phase < 0.66) return 1 - 0.92 * smoothstep(0.52, 0.66, phase);
+    if (phase < 0.94) return 0.08;
+    return 0.08 + 0.1 * smoothstep(0.94, 1, phase);
+  }
+  function newGame() {
+    const tiles = [];
+    for (let i = 0; i < 4; i++) tiles.push({ hp: 100, s: null });
+    tiles[0].s = { type: "anchor", down: false };
+    const G2 = {
+      // ---- persistent ----
+      version: 1,
+      time: C.START_PHASE * C.DAY_LEN,
+      // seconds since the first sunrise
+      player: {
+        x: 2 * C.TILE_W,
+        y: -C.DECK_H,
+        vx: 0,
+        vy: 0,
+        facing: 1,
+        hp: 100,
+        hunger: 85,
+        thirst: 80,
+        oxygen: 100,
+        tool: "hook"
+      },
+      raft: { x: 0, tiles, anchored: false, sailUp: false },
+      inv: {
+        hook: 1,
+        hammer: 1,
+        wood: 4,
+        plastic: 2,
+        rope: 2,
+        cloth: 0,
+        metal: 0,
+        leaf: 0,
+        stone: 0,
+        coconut: 1,
+        raw_fish: 0,
+        cooked_fish: 0,
+        can: 0,
+        water: 1,
+        berry: 0
+      },
+      codex: {},
+      // id -> day first seen
+      journal: [],
+      // [{day, text}]
+      persist: { islands: {}, flags: {} },
+      // module-owned saved data (plain JSON only)
+      // ---- runtime (rebuilt every session) ----
+      mode: "title",
+      // 'title' | 'play' | 'pause' | 'panel' | 'dead' | 'ending'
+      panel: null,
+      // 'craft' | 'journal' while mode === 'panel'
+      demo: false,
+      // true for the title-screen backdrop instance
+      phase: 0,
+      day: 1,
+      light: 1,
+      dt: 0,
+      frame: 0,
+      cam: { x: 2 * C.TILE_W, y: -70, shakeX: 0, shakeY: 0 },
+      shake: 0,
+      // add to this (0..1) for screen shake; core decays it
+      fade: 0,
+      // 0..1 full-screen black (cutscene fades); post.drawPost paints it
+      view: { cssW: 1, cssH: 1, dpr: 1, scale: 1, w: 1, h: 1, left: 0, top: 0, seaScreenY: 0 },
+      lights: [],
+      // cleared each step: {x, y, r, color:[r,g,b], a}
+      interactables: [],
+      // filled during a step: {x, y, r, label, act(G), priority}
+      interactablesLast: [],
+      // the complete list from the previous step (player picks from this)
+      hits: [],
+      // cleared each step: {x, y, r, dmg, kind, from}
+      particles: [],
+      toasts: [],
+      // {text, kind, t}
+      prompt: null,
+      // {x, y, label} chosen interactable (set by player)
+      weather: { kind: "clear", wave: 1, rain: 0, wind: 0.3, fog: 0, lightning: 0 },
+      hook: null,
+      // owned by player.js
+      debris: [],
+      fish: [],
+      creatures: [],
+      beasts: [],
+      islands: []
+      // built by islands.js from persist + journey layout
+    };
+    syncTime(G2);
+    return G2;
+  }
+  function syncTime(G2) {
+    const d = G2.time / C.DAY_LEN;
+    G2.day = Math.floor(d) + 1;
+    G2.phase = d - Math.floor(d);
+    G2.light = daylight(G2.phase);
+  }
+
+  // src/core/input.js
+  var input = {
+    left: false,
+    right: false,
+    up: false,
+    down: false,
+    // held
+    use: false,
+    // held: primary action (mouse button / touch on canvas / 使用 button)
+    usePressed: false,
+    useReleased: false,
+    jumpPressed: false,
+    // Space / W / ↑ / ▲ button (also "swim up" while held via `up`)
+    interactPressed: false,
+    // E / 互动 button
+    cyclePressed: false,
+    // Q / mouse wheel / 切换 button (build-mode piece)
+    craftPressed: false,
+    // Tab / C / 背包 button
+    journalPressed: false,
+    // J / 图鉴 button
+    pausePressed: false,
+    // Esc / P
+    eatPressed: false,
+    // F: eat best food
+    drinkPressed: false,
+    // R: drink water
+    toolPressed: 0,
+    // 1..4 number keys / tool buttons; 0 = none
+    aimFromPointer: false,
+    // true while the pointer gives a real aim point
+    mouse: { sx: 0, sy: 0, wx: 0, wy: 0, inside: false },
+    touch: false
+    // last input came from a touchscreen
+  };
+  var held = { left: /* @__PURE__ */ new Set(), right: /* @__PURE__ */ new Set(), up: /* @__PURE__ */ new Set(), down: /* @__PURE__ */ new Set(), use: /* @__PURE__ */ new Set() };
+  function setHeld(name, src, on) {
+    const s = held[name];
+    if (on) s.add(src);
+    else s.delete(src);
+    const was = input[name];
+    input[name] = s.size > 0;
+    if (name === "use") {
+      if (input.use && !was) input.usePressed = true;
+      if (!input.use && was) input.useReleased = true;
+    }
+    if (name === "up" && input.up && !was) input.jumpPressed = true;
+  }
+  var KEYMAP = {
+    ArrowLeft: "left",
+    KeyA: "left",
+    ArrowRight: "right",
+    KeyD: "right",
+    ArrowUp: "up",
+    KeyW: "up",
+    Space: "up",
+    ArrowDown: "down",
+    KeyS: "down"
+  };
+  function initInput(canvas2) {
+    window.addEventListener("keydown", (e) => {
+      if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+      input.touch = false;
+      const k = KEYMAP[e.code];
+      if (k) {
+        setHeld(k, "key:" + e.code, true);
+        e.preventDefault();
+        return;
+      }
+      if (e.repeat) return;
+      switch (e.code) {
+        case "KeyE":
+          input.interactPressed = true;
+          break;
+        case "KeyQ":
+          input.cyclePressed = true;
+          break;
+        case "Tab":
+        case "KeyC":
+          input.craftPressed = true;
+          e.preventDefault();
+          break;
+        case "KeyJ":
+          input.journalPressed = true;
+          break;
+        case "Escape":
+        case "KeyP":
+          input.pausePressed = true;
+          break;
+        case "KeyF":
+          input.eatPressed = true;
+          break;
+        case "KeyR":
+          input.drinkPressed = true;
+          break;
+        case "Digit1":
+        case "Digit2":
+        case "Digit3":
+        case "Digit4":
+          input.toolPressed = Number(e.code.slice(5));
+          break;
+      }
+    });
+    window.addEventListener("keyup", (e) => {
+      const k = KEYMAP[e.code];
+      if (k) setHeld(k, "key:" + e.code, false);
+    });
+    window.addEventListener("blur", () => {
+      for (const name of Object.keys(held)) {
+        held[name].clear();
+        input[name] = false;
+      }
+    });
+    canvas2.addEventListener("pointerdown", (e) => {
+      input.touch = e.pointerType === "touch";
+      trackPointer(e);
+      input.aimFromPointer = true;
+      setHeld("use", "ptr:" + e.pointerId, true);
+      try {
+        canvas2.setPointerCapture(e.pointerId);
+      } catch (er) {
+      }
+    });
+    canvas2.addEventListener("pointermove", (e) => {
+      if (e.pointerType === "mouse") {
+        input.touch = false;
+        input.aimFromPointer = true;
+      }
+      trackPointer(e);
+    });
+    const up = (e) => {
+      setHeld("use", "ptr:" + e.pointerId, false);
+      if (e.pointerType === "touch") input.aimFromPointer = false;
+    };
+    canvas2.addEventListener("pointerup", up);
+    canvas2.addEventListener("pointercancel", up);
+    canvas2.addEventListener("pointerleave", (e) => {
+      if (e.pointerType === "mouse") input.mouse.inside = false;
+    });
+    canvas2.addEventListener("wheel", (e) => {
+      input.cyclePressed = true;
+      e.preventDefault();
+    }, { passive: false });
+    canvas2.addEventListener("contextmenu", (e) => e.preventDefault());
+  }
+  function trackPointer(e) {
+    input.mouse.sx = e.clientX;
+    input.mouse.sy = e.clientY;
+    input.mouse.inside = true;
+  }
+  function endInputFrame() {
+    input.usePressed = false;
+    input.useReleased = false;
+    input.jumpPressed = false;
+    input.interactPressed = false;
+    input.cyclePressed = false;
+    input.craftPressed = false;
+    input.journalPressed = false;
+    input.pausePressed = false;
+    input.eatPressed = false;
+    input.drinkPressed = false;
+    input.toolPressed = 0;
+  }
+
+  // src/core/particles.js
+  function updateParticles(G2, dt, waterY3) {
+    const arr = G2.particles;
+    let w = 0;
+    for (let i = 0; i < arr.length; i++) {
+      const p = arr[i];
+      p.life -= dt;
+      if (p.life <= 0) continue;
+      p.vy += p.gravity * dt;
+      const d = 1 / (1 + p.drag * dt);
+      p.vx *= d;
+      p.vy *= d;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.size += p.grow * dt;
+      if (p.kind === "bubble") {
+        p.vx += Math.sin((p.life + p.x) * 6) * 8 * dt;
+        if (p.y < waterY3(G2, p.x)) continue;
+      }
+      if (p.water === "below" && p.y < waterY3(G2, p.x) - 2) continue;
+      arr[w++] = p;
+    }
+    arr.length = w;
+  }
+  function drawParticles(ctx2, G2) {
+    for (const p of G2.particles) {
+      const f = clamp(p.life / p.max, 0, 1);
+      const a = p.alpha * (p.kind === "glow" ? Math.sin(f * Math.PI) : Math.min(1, f * 2.5));
+      if (a <= 0.01) continue;
+      const [r, g, b] = p.color;
+      if (p.kind === "bubble") {
+        ctx2.strokeStyle = `rgba(${r},${g},${b},${a * 0.8})`;
+        ctx2.lineWidth = Math.max(0.6, p.size * 0.25);
+        ctx2.beginPath();
+        ctx2.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx2.stroke();
+        ctx2.fillStyle = `rgba(255,255,255,${a * 0.5})`;
+        ctx2.fillRect(p.x - p.size * 0.4, p.y - p.size * 0.5, p.size * 0.35, p.size * 0.35);
+      } else if (p.kind === "streak") {
+        ctx2.strokeStyle = `rgba(${r},${g},${b},${a})`;
+        ctx2.lineWidth = p.size;
+        ctx2.beginPath();
+        ctx2.moveTo(p.x, p.y);
+        ctx2.lineTo(p.x - p.vx * 0.04, p.y - p.vy * 0.04);
+        ctx2.stroke();
+      } else if (p.kind === "glow") {
+        const g2 = ctx2.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.size * 3);
+        g2.addColorStop(0, `rgba(${r},${g},${b},${a})`);
+        g2.addColorStop(1, `rgba(${r},${g},${b},0)`);
+        ctx2.fillStyle = g2;
+        ctx2.fillRect(p.x - p.size * 3, p.y - p.size * 3, p.size * 6, p.size * 6);
+      } else {
+        ctx2.fillStyle = `rgba(${r},${g},${b},${a})`;
+        ctx2.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+      }
+    }
+  }
+
+  // src/render/sea.js
+  var sea_exports = {};
+  __export(sea_exports, {
+    drawBackdrop: () => drawBackdrop,
+    drawSeabed: () => drawSeabed,
+    drawSurface: () => drawSurface,
+    init: () => init,
+    seabedY: () => seabedY,
+    update: () => update,
+    waterY: () => waterY
+  });
+  function init(G2) {
+  }
+  function update(G2, dt) {
+  }
+  function waterY(G2, x) {
+    return Math.sin(x * 0.02 + G2.time * 1.3) * 3 * G2.weather.wave;
+  }
+  function seabedY(G2, x) {
+    return 620 + Math.sin(x * 3e-3) * 120;
+  }
+  function drawBackdrop(ctx2, G2) {
+    const v = G2.view;
+    ctx2.fillStyle = "#1d3a4a";
+    ctx2.fillRect(0, Math.max(0, v.seaScreenY), v.cssW, v.cssH);
+  }
+  function drawSeabed(ctx2, G2) {
+    const v = G2.view;
+    ctx2.fillStyle = "#1a1a1a";
+    ctx2.beginPath();
+    ctx2.moveTo(v.left, v.top + v.h + 50);
+    for (let x = v.left; x <= v.left + v.w + 10; x += 10) ctx2.lineTo(x, seabedY(G2, x));
+    ctx2.lineTo(v.left + v.w + 10, v.top + v.h + 50);
+    ctx2.fill();
+  }
+  function drawSurface(ctx2, G2) {
+    const v = G2.view;
+    ctx2.strokeStyle = "#cfe";
+    ctx2.lineWidth = 1;
+    ctx2.beginPath();
+    for (let x = v.left; x <= v.left + v.w + 10; x += 6) ctx2.lineTo(x, waterY(G2, x));
+    ctx2.stroke();
+  }
+
+  // src/systems/raft.js
+  var raft_exports = {};
+  __export(raft_exports, {
+    deckAt: () => deckAt,
+    draw: () => draw,
+    drawBuildGhost: () => drawBuildGhost,
+    init: () => init2,
+    update: () => update2
+  });
+  function init2(G2) {
+  }
+  function update2(G2, dt) {
+    const R = G2.raft;
+    R.vx = R.anchored ? 0 : C.DRIFT + (R.sailUp ? C.SAIL_BOOST : 0);
+    R.x += R.vx * dt;
+    R.y = waterY2(G2, R.x + R.tiles.length * C.TILE_W / 2) - C.DECK_H;
+  }
+  function deckAt(G2, x) {
+    const R = G2.raft;
+    if (R.y == null) return null;
+    return x >= R.x && x <= R.x + R.tiles.length * C.TILE_W ? R.y : null;
+  }
+  function draw(ctx2, G2) {
+    const R = G2.raft;
+    ctx2.fillStyle = "#6b4a2a";
+    ctx2.fillRect(R.x, R.y, R.tiles.length * C.TILE_W, 8);
+  }
+  function drawBuildGhost(ctx2, G2) {
+  }
+
+  // src/systems/islands.js
+  var islands_exports = {};
+  __export(islands_exports, {
+    debugSpawn: () => debugSpawn,
+    debugTeleport: () => debugTeleport,
+    drawBack: () => drawBack,
+    drawFront: () => drawFront,
+    groundAt: () => groundAt,
+    init: () => init3,
+    islandAt: () => islandAt,
+    update: () => update3
+  });
+  function init3(G2) {
+  }
+  function update3(G2, dt) {
+  }
+  function groundAt(G2, x) {
+    return null;
+  }
+  function drawBack(ctx2, G2) {
+  }
+  function drawFront(ctx2, G2) {
+  }
+  function debugTeleport(G2, i) {
+    return false;
+  }
+  function debugSpawn(G2, kind) {
+    return false;
+  }
+  function islandAt(G2, x) {
+    return null;
+  }
+
+  // src/core/world.js
+  var waterY2 = (G2, x) => waterY(G2, x);
+  function groundAt2(G2, x, fromY = -1e9) {
+    let best = null;
+    const r = deckAt(G2, x);
+    if (r != null && r >= fromY - 2) best = { y: r, kind: "raft" };
+    const i = groundAt(G2, x);
+    if (i != null && i >= fromY - 2 && (!best || i < best.y)) best = { y: i, kind: "island" };
+    const s = seabedY(G2, x);
+    if (s >= fromY - 2 && (!best || s < best.y)) best = { y: s, kind: "seabed" };
+    return best;
+  }
+  function screenToWorld(G2, sx, sy) {
+    const v = G2.view;
+    return { x: G2.cam.x + (sx - v.cssW / 2) / v.scale, y: G2.cam.y + (sy - v.cssH / 2) / v.scale };
+  }
+
+  // src/core/save.js
+  var KEY = "shaonian-yu-hai:save:v1";
+  var PERSISTENT = ["version", "time", "raft", "inv", "codex", "journal", "persist"];
+  var PLAYER_KEYS = ["x", "y", "facing", "hp", "hunger", "thirst", "oxygen", "tool"];
+  function hasSave() {
+    try {
+      return !!localStorage.getItem(KEY);
+    } catch (e) {
+      return false;
+    }
+  }
+  function saveGame(G2) {
+    if (G2.demo || G2.mode === "dead") return false;
+    try {
+      const data = {};
+      for (const k of PERSISTENT) data[k] = G2[k];
+      data.player = {};
+      for (const k of PLAYER_KEYS) data.player[k] = G2.player[k];
+      localStorage.setItem(KEY, JSON.stringify(data));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+  function loadGame() {
+    try {
+      const raw = localStorage.getItem(KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      const G2 = newGame();
+      for (const k of PERSISTENT) if (data[k] !== void 0) G2[k] = data[k];
+      Object.assign(G2.player, data.player || {});
+      G2.player.vx = 0;
+      G2.player.vy = 0;
+      G2.persist = Object.assign({ islands: {}, flags: {} }, G2.persist || {});
+      G2.inv = Object.assign(newGame().inv, G2.inv || {});
+      syncTime(G2);
+      G2.loaded = true;
+      return G2;
+    } catch (e) {
+      return null;
+    }
+  }
+  function deleteSave() {
+    try {
+      localStorage.removeItem(KEY);
+    } catch (e) {
+    }
+  }
+
+  // src/core/assets.js
+  var ASSET_LIST = {
+    sky_day: "assets/sky_day",
+    // daytime sky panorama, horizon at ~62% height, no sea
+    sky_dusk: "assets/sky_dusk",
+    // sunset / dusk sky panorama
+    sky_night: "assets/sky_night",
+    // night sky with crescent moon and moonlit clouds
+    horizon_day: "assets/horizon_day",
+    // far horizon strip (distant islands / sea stacks), transparent
+    horizon_night: "assets/horizon_night",
+    island: "assets/island",
+    // side view of a small tropical island, transparent background
+    lighthouse: "assets/lighthouse",
+    // the lighthouse island (ending), transparent background
+    title: "assets/title"
+    // title screen key art
+  };
+  var EXTS = ["png", "webp", "jpg"];
+  var loaded = {};
+  function loadAssets(onEach) {
+    for (const [key, base] of Object.entries(ASSET_LIST)) tryLoad(key, base, 0, onEach);
+  }
+  function tryLoad(key, base, i, onEach) {
+    if (i >= EXTS.length) return;
+    const img = new Image();
+    img.onload = () => {
+      loaded[key] = img;
+      onEach && onEach(key, img);
+    };
+    img.onerror = () => tryLoad(key, base, i + 1, onEach);
+    img.src = base + "." + EXTS[i];
+  }
+
+  // src/render/sky.js
+  var sky_exports = {};
+  __export(sky_exports, {
+    celestial: () => celestial,
+    debugWeather: () => debugWeather,
+    drawSky: () => drawSky,
+    drawWeather: () => drawWeather,
+    init: () => init4,
+    update: () => update4
+  });
+  function init4(G2) {
+  }
+  function update4(G2, dt) {
+  }
+  function drawSky(ctx2, G2) {
+    const v = G2.view;
+    const g = ctx2.createLinearGradient(0, 0, 0, v.seaScreenY);
+    g.addColorStop(0, "#3a5a7a");
+    g.addColorStop(1, "#c9a98a");
+    ctx2.fillStyle = g;
+    ctx2.fillRect(0, 0, v.cssW, Math.max(0, v.seaScreenY));
+  }
+  function drawWeather(ctx2, G2) {
+  }
+  function debugWeather(G2, kind) {
+    G2.weather.kind = kind;
+  }
+  function celestial(G2) {
+    return { sunX: G2.view.cssW * 0.7, sunY: G2.view.seaScreenY - 200, sunVisible: G2.light > 0.3, moonX: G2.view.cssW * 0.4, moonY: G2.view.seaScreenY - 250, moonVisible: G2.light < 0.3, sunColor: [255, 220, 170] };
+  }
+
+  // src/render/post.js
+  var post_exports = {};
+  __export(post_exports, {
+    drawLighting: () => drawLighting,
+    drawPost: () => drawPost,
+    init: () => init5,
+    resize: () => resize
+  });
+  function init5(G2) {
+  }
+  function resize(G2) {
+  }
+  function drawLighting(ctx2, G2) {
+  }
+  function drawPost(ctx2, G2) {
+  }
+
+  // src/entities/player.js
+  var player_exports = {};
+  __export(player_exports, {
+    draw: () => draw2,
+    hurtPlayer: () => hurtPlayer,
+    init: () => init6,
+    update: () => update5
+  });
+  function init6(G2) {
+  }
+  function update5(G2, dt) {
+    const P = G2.player;
+    P.vx = (input.right - input.left) * 70;
+    if (input.right) P.facing = 1;
+    if (input.left) P.facing = -1;
+    P.x += P.vx * dt;
+    const g = groundAt2(G2, P.x, P.y);
+    if (g) P.y = g.y;
+  }
+  function draw2(ctx2, G2) {
+    const P = G2.player;
+    ctx2.fillStyle = "#222";
+    ctx2.fillRect(P.x - 6, P.y - 28, 12, 28);
+  }
+  function hurtPlayer(G2, dmg, fromX, kind) {
+    G2.player.hp -= dmg;
+  }
+
+  // src/entities/debris.js
+  var debris_exports = {};
+  __export(debris_exports, {
+    collectAttached: () => collectAttached,
+    draw: () => draw3,
+    hookCatch: () => hookCatch,
+    init: () => init7,
+    update: () => update6
+  });
+  function init7(G2) {
+  }
+  function update6(G2, dt) {
+  }
+  function draw3(ctx2, G2) {
+  }
+  function hookCatch(G2, x, y, r) {
+    return 0;
+  }
+  function collectAttached(G2) {
+    return [];
+  }
+
+  // src/entities/life.js
+  var life_exports = {};
+  __export(life_exports, {
+    debugSpawn: () => debugSpawn2,
+    draw: () => draw4,
+    drawDeep: () => drawDeep,
+    drawHorizon: () => drawHorizon,
+    init: () => init8,
+    update: () => update7
+  });
+  function init8(G2) {
+  }
+  function update7(G2, dt) {
+  }
+  function drawHorizon(ctx2, G2) {
+  }
+  function drawDeep(ctx2, G2) {
+  }
+  function draw4(ctx2, G2) {
+  }
+  function debugSpawn2(G2, kind) {
+    return false;
+  }
+
+  // src/systems/inventory.js
+  var inventory_exports = {};
+  __export(inventory_exports, {
+    ITEMS: () => ITEMS,
+    addItem: () => addItem,
+    count: () => count,
+    hasItems: () => hasItems,
+    init: () => init9,
+    takeItems: () => takeItems,
+    useItem: () => useItem
+  });
+  var ITEMS = {};
+  function init9(G2) {
+  }
+  var count = (G2, id) => G2.inv[id] || 0;
+  function addItem(G2, id, n = 1) {
+    G2.inv[id] = (G2.inv[id] || 0) + n;
+  }
+  function hasItems(G2, cost) {
+    return Object.entries(cost).every(([k, n]) => (G2.inv[k] || 0) >= n);
+  }
+  function takeItems(G2, cost) {
+    if (!hasItems(G2, cost)) return false;
+    for (const [k, n] of Object.entries(cost)) G2.inv[k] -= n;
+    return true;
+  }
+  function useItem(G2, id) {
+    return false;
+  }
+
+  // src/systems/craft.js
+  var craft_exports = {};
+  __export(craft_exports, {
+    RECIPES: () => RECIPES,
+    canCraft: () => canCraft,
+    craft: () => craft,
+    init: () => init10,
+    update: () => update8
+  });
+  var RECIPES = {};
+  function init10(G2) {
+  }
+  function update8(G2, dt) {
+  }
+  function canCraft(G2, id) {
+    return false;
+  }
+  function craft(G2, id) {
+    return false;
+  }
+
+  // src/systems/audio.js
+  var audio_exports = {};
+  __export(audio_exports, {
+    init: () => init11,
+    isMuted: () => isMuted,
+    setMuted: () => setMuted,
+    sfx: () => sfx,
+    unlockAudio: () => unlockAudio,
+    update: () => update9
+  });
+  function init11(G2) {
+  }
+  function update9(G2, dt) {
+  }
+  function sfx(name, opts) {
+  }
+  function unlockAudio() {
+  }
+  function setMuted(m) {
+  }
+  function isMuted() {
+    return false;
+  }
+
+  // src/ui/hud.js
+  var API = null;
+  function initUI(api2) {
+    API = api2;
+    const b = document.createElement("button");
+    b.textContent = "开始";
+    b.id = "stub-start";
+    b.style.cssText = "position:fixed;left:50%;top:60%;pointer-events:auto;font-size:24px";
+    b.onclick = () => {
+      api2.startNew();
+      b.remove();
+    };
+    document.getElementById("ui").appendChild(b);
+  }
+  function onStart(G2, how) {
+  }
+  function frame(G2, dt) {
+  }
+
+  // src/main.js
+  var canvas = document.getElementById("game");
+  var ctx = canvas.getContext("2d");
+  var G = null;
+  var errors = {};
+  window.__raftErrors = errors;
+  function run(tag, fn) {
+    try {
+      return fn();
+    } catch (e) {
+      const rec = errors[tag] || (errors[tag] = { count: 0, msg: String(e && e.message), stack: String(e && e.stack).split("\n").slice(0, 4).join(" | ") });
+      rec.count++;
+      if (rec.count === 1) console.error("[" + tag + "]", e);
+      return void 0;
+    }
+  }
+  var INIT_ORDER = [
+    ["sky", sky_exports],
+    ["sea", sea_exports],
+    ["post", post_exports],
+    ["inventory", inventory_exports],
+    ["craft", craft_exports],
+    ["raft", raft_exports],
+    ["islands", islands_exports],
+    ["debris", debris_exports],
+    ["life", life_exports],
+    ["player", player_exports],
+    ["audio", audio_exports]
+  ];
+  function initModules(g) {
+    for (const [name, m] of INIT_ORDER) if (m.init) run(name + ".init", () => m.init(g));
+  }
+  function makeDemo() {
+    const g = newGame();
+    g.demo = true;
+    g.mode = "title";
+    g.time = 0.53 * C.DAY_LEN;
+    g.raft.anchored = true;
+    g.raft.tiles.push({ hp: 100, s: { type: "lamp", on: true } }, { hp: 100, s: null });
+    g.raft.tiles[2].s = { type: "sail", up: true };
+    syncTime(g);
+    initModules(g);
+    return g;
+  }
+  var api = {
+    hasSave,
+    startNew() {
+      deleteSave();
+      G = newGame();
+      G.mode = "play";
+      initModules(G);
+      run("hud.onStart", () => onStart && onStart(G, "new"));
+      snapCamera();
+    },
+    continueGame() {
+      const g = loadGame();
+      if (!g) return api.startNew();
+      G = g;
+      G.mode = "play";
+      initModules(G);
+      run("hud.onStart", () => onStart && onStart(G, "continue"));
+      snapCamera();
+    },
+    save() {
+      return G ? saveGame(G) : false;
+    },
+    toTitle() {
+      if (G && !G.demo && G.mode !== "dead") saveGame(G);
+      G = makeDemo();
+      snapCamera();
+    },
+    restart() {
+      api.startNew();
+    },
+    get G() {
+      return G;
+    }
+  };
+  function resize2() {
+    const cssW = Math.max(1, window.innerWidth), cssH = Math.max(1, window.innerHeight);
+    let dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    if (cssW * cssH * dpr * dpr > 26e5) dpr = Math.sqrt(26e5 / (cssW * cssH));
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    const v = G.view;
+    v.cssW = cssW;
+    v.cssH = cssH;
+    v.dpr = dpr;
+    v.scale = Math.min(cssH / C.VIEW_H, cssW / C.MIN_VIEW_W);
+    v.w = cssW / v.scale;
+    v.h = cssH / v.scale;
+    run("post.resize", () => resize && resize(G));
+  }
+  function syncView() {
+    const v = G.view, wv = window.innerWidth, hv = window.innerHeight;
+    if (v.cssW !== wv || v.cssH !== hv || canvas.width === 0) resize2();
+    v.left = G.cam.x - v.w / 2;
+    v.top = G.cam.y - v.h / 2;
+    v.seaScreenY = (0 - G.cam.y) * v.scale + v.cssH / 2;
+  }
+  function camTarget() {
+    const P = G.player;
+    if (G.mode === "title") return { x: G.raft.x + G.raft.tiles.length * C.TILE_W * 0.5 - 30, y: -95 };
+    const above = P.y < 30;
+    return { x: P.x + P.facing * 34, y: above ? P.y - 72 : P.y - 10 };
+  }
+  function snapCamera() {
+    syncView();
+    const t = camTarget();
+    G.cam.x = t.x;
+    G.cam.y = t.y;
+  }
+  function updateCamera(dt) {
+    const t = camTarget();
+    const k = Math.min(1, dt * 3.2);
+    G.cam.x += (t.x - G.cam.x) * k;
+    G.cam.y += (t.y - G.cam.y) * Math.min(1, dt * 2.6);
+    G.shake = Math.max(0, G.shake - dt * 2.5);
+    const s = Math.min(1, G.shake) * 7;
+    G.cam.shakeX = s ? rand(-s, s) : 0;
+    G.cam.shakeY = s ? rand(-s, s) : 0;
+  }
+  function step(dt, demo) {
+    G.dt = dt;
+    G.time += dt;
+    G.frame++;
+    const prevDay = G.day;
+    syncTime(G);
+    G.lights.length = 0;
+    G.interactablesLast = G.interactables;
+    G.interactables = [];
+    run("sky.update", () => update4(G, dt));
+    run("sea.update", () => update(G, dt));
+    run("raft.update", () => update2(G, dt));
+    if (!demo) run("player.update", () => update5(G, dt));
+    run("debris.update", () => update6(G, dt));
+    run("life.update", () => update7(G, dt));
+    run("islands.update", () => update3(G, dt));
+    run("craft.update", () => update8 && update8(G, dt));
+    run("particles", () => updateParticles(G, dt, waterY2));
+    G.hits.length = 0;
+    if (!demo && G.day !== prevDay) saveGame(G);
+  }
+  function render() {
+    const v = G.view, d = v.dpr;
+    const screenT = () => ctx.setTransform(d, 0, 0, d, 0, 0);
+    const worldT = () => ctx.setTransform(
+      v.scale * d,
+      0,
+      0,
+      v.scale * d,
+      (v.cssW / 2 - (G.cam.x + G.cam.shakeX) * v.scale) * d,
+      (v.cssH / 2 - (G.cam.y + G.cam.shakeY) * v.scale) * d
+    );
+    const layer = (tag, fn, world) => {
+      ctx.save();
+      world ? worldT() : screenT();
+      run(tag, fn);
+      ctx.restore();
+    };
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "#05070c";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    layer("sky.drawSky", () => drawSky(ctx, G), false);
+    layer("life.drawHorizon", () => drawHorizon(ctx, G), false);
+    layer("sea.drawBackdrop", () => drawBackdrop(ctx, G), false);
+    layer("sea.drawSeabed", () => drawSeabed(ctx, G), true);
+    layer("life.drawDeep", () => drawDeep(ctx, G), true);
+    layer("islands.drawBack", () => drawBack(ctx, G), true);
+    layer("debris.draw", () => draw3(ctx, G), true);
+    layer("raft.draw", () => draw(ctx, G), true);
+    layer("life.draw", () => draw4(ctx, G), true);
+    layer("player.draw", () => draw2(ctx, G), true);
+    layer("islands.drawFront", () => drawFront(ctx, G), true);
+    layer("particles.draw", () => drawParticles(ctx, G), true);
+    layer("sea.drawSurface", () => drawSurface(ctx, G), true);
+    layer("raft.drawBuildGhost", () => drawBuildGhost(ctx, G), true);
+    layer("post.drawLighting", () => drawLighting(ctx, G), false);
+    layer("sky.drawWeather", () => drawWeather(ctx, G), false);
+    layer("post.drawPost", () => drawPost(ctx, G), false);
+  }
+  var last = 0;
+  function frame2(now) {
+    const dt = Math.min(0.05, Math.max(0, (now - last) / 1e3));
+    last = now;
+    syncView();
+    const m = input.mouse, w = screenToWorld(G, m.sx, m.sy);
+    m.wx = w.x;
+    m.wy = w.y;
+    run("hud.frame", () => frame(G, dt));
+    if (G.mode === "play") step(dt, false);
+    else if (G.mode === "title") step(dt, true);
+    run("audio.update", () => update9(G, dt));
+    updateCamera(dt);
+    syncView();
+    render();
+    endInputFrame();
+    requestAnimationFrame(frame2);
+  }
+  function boot() {
+    G = makeDemo();
+    initInput(canvas);
+    resize2();
+    snapCamera();
+    loadAssets();
+    run("hud.initUI", () => initUI(api));
+    window.addEventListener("resize", () => resize2());
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden && G && G.mode === "play") {
+        saveGame(G);
+        G.mode = "pause";
+      }
+    });
+    requestAnimationFrame((t) => {
+      last = t;
+      frame2(t);
+    });
+  }
+  window.__raft = {
+    get G() {
+      return G;
+    },
+    api,
+    errors,
+    start() {
+      api.startNew();
+    },
+    setPhase(p) {
+      G.time = (G.day - 1 + p) * C.DAY_LEN;
+      syncTime(G);
+    },
+    tp(x, y) {
+      const P = G.player;
+      P.x = x;
+      P.y = y;
+      P.vx = 0;
+      P.vy = 0;
+      snapCamera();
+    },
+    give(id, n = 1) {
+      G.inv[id] = (G.inv[id] || 0) + n;
+    },
+    sim(seconds, dt = 1 / 30) {
+      for (let t = 0; t < seconds; t += dt) step(dt, false);
+      snapCamera();
+    },
+    spawn(kind) {
+      return run("debugSpawn", () => debugSpawn2 && debugSpawn2(G, kind) || debugSpawn && debugSpawn(G, kind));
+    },
+    island(i = 0) {
+      return run("islands.debugTeleport", () => debugTeleport && debugTeleport(G, i));
+    },
+    weather(kind) {
+      return run("sky.debugWeather", () => debugWeather && debugWeather(G, kind));
+    },
+    mode(m, panel = null) {
+      G.mode = m;
+      G.panel = panel;
+    },
+    snap: snapCamera
+  };
+  boot();
+})();
+
+</script>
+<!-- page:end -->
+</body>
+</html>

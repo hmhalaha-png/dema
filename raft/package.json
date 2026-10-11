@@ -1,0 +1,14 @@
+{
+  "name": "shaonian-yu-hai",
+  "private": true,
+  "version": "0.1.0",
+  "description": "少年与海：深海木筏求生 2D 游戏",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "smoke": "node tools/smoke.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.2"
+  }
+}
