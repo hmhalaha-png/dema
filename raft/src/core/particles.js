@@ -1,7 +1,26 @@
 // Shared particle pool (bubbles, splashes, sparks, dust, glow motes).
 // emit(G, {...}) from any module; the core updates and draws them in world space.
 
-import { clamp } from './util.js';
+import { clamp, makeCanvas } from './util.js';
+
+// One cached soft-glow sprite per (quantized) colour instead of a gradient per particle.
+const glowCache = new Map();
+function glowSprite(c) {
+  const key = ((c[0] >> 4) << 8) | ((c[1] >> 4) << 4) | (c[2] >> 4);
+  let s = glowCache.get(key);
+  if (!s) {
+    s = makeCanvas(32, 32);
+    const g = s.getContext('2d');
+    const gr = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+    gr.addColorStop(0, `rgba(${c[0]},${c[1]},${c[2]},1)`);
+    gr.addColorStop(0.35, `rgba(${c[0]},${c[1]},${c[2]},0.45)`);
+    gr.addColorStop(1, `rgba(${c[0]},${c[1]},${c[2]},0)`);
+    g.fillStyle = gr; g.fillRect(0, 0, 32, 32);
+    if (glowCache.size > 64) glowCache.clear();
+    glowCache.set(key, s);
+  }
+  return s;
+}
 
 const MAX = 600;
 
@@ -55,11 +74,9 @@ export function drawParticles(ctx, G) {
       ctx.lineWidth = p.size;
       ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.vx * 0.04, p.y - p.vy * 0.04); ctx.stroke();
     } else if (p.kind === 'glow') {
-      const g2 = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.size * 3);
-      g2.addColorStop(0, `rgba(${r},${g},${b},${a})`);
-      g2.addColorStop(1, `rgba(${r},${g},${b},0)`);
-      ctx.fillStyle = g2;
-      ctx.fillRect(p.x - p.size * 3, p.y - p.size * 3, p.size * 6, p.size * 6);
+      ctx.globalAlpha = a;
+      ctx.drawImage(glowSprite(p.color), p.x - p.size * 3, p.y - p.size * 3, p.size * 6, p.size * 6);
+      ctx.globalAlpha = 1;
     } else {
       ctx.fillStyle = `rgba(${r},${g},${b},${a})`;
       ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
