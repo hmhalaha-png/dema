@@ -5,7 +5,7 @@ import { C, newGame, syncTime } from './core/state.js';
 import { input, initInput, endInputFrame } from './core/input.js';
 import { updateParticles, drawParticles } from './core/particles.js';
 import { waterY, screenToWorld } from './core/world.js';
-import { saveGame, loadGame, hasSave, deleteSave } from './core/save.js';
+import { saveGame, loadGame, hasSave, deleteSave, isSafeToSave } from './core/save.js';
 import { loadAssets } from './core/assets.js';
 import { clamp, rand } from './core/util.js';
 
@@ -78,8 +78,16 @@ const api = {
     run('hud.onStart', () => hud.onStart && hud.onStart(G, 'continue'));
     snapCamera();
   },
-  save() { return G ? saveGame(G) : false; },
-  toTitle() { if (G && !G.demo && G.mode !== 'dead') saveGame(G); G = makeDemo(); snapCamera(); },
+  // Manual save (pause menu). Returns false when the boy is somewhere unsafe — the HUD should
+  // then tell the player to get back to the raft first, so a reload never lands in a death.
+  save() { return G && isSafeToSave(G) ? saveGame(G) : false; },
+  toTitle() {
+    if (G && !G.demo) {
+      if (G.mode === 'ending') deleteSave();            // the journey is over; nothing to continue
+      else if (G.mode !== 'dead' && isSafeToSave(G)) saveGame(G);
+    }
+    G = makeDemo(); snapCamera();
+  },
   restart() { api.startNew(); },
   get G() { return G; },
 };
@@ -141,7 +149,9 @@ function step(dt, demo) {
   run('craft.update', () => craft.update && craft.update(G, dt));
   run('particles', () => updateParticles(G, dt, waterY));
   G.hits.length = 0;
-  if (!demo && G.day !== prevDay) saveGame(G);
+  // Autosave at each new day, but only once the boy is somewhere safe (never mid-dive or mid-chase).
+  if (!demo && G.day !== prevDay) G.pendingSave = true;
+  if (!demo && G.pendingSave && isSafeToSave(G)) { G.pendingSave = false; saveGame(G); }
 }
 
 // ---------- draw order (see CONTRACT.md §4) ----------
@@ -204,7 +214,7 @@ function boot() {
   run('hud.initUI', () => hud.initUI(api));
   window.addEventListener('resize', () => resize());
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && G && G.mode === 'play') { saveGame(G); G.mode = 'pause'; }
+    if (document.hidden && G && G.mode === 'play') { if (isSafeToSave(G)) saveGame(G); G.mode = 'pause'; }
   });
   requestAnimationFrame((t) => { last = t; frame(t); });
 }

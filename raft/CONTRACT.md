@@ -226,3 +226,15 @@ the lighthouse light visible on the horizon at night once x > 15000; ending.
   `spawn(kind)`, `island(i)`, `weather(kind)`, `mode(m,panel)`.
 - Other workers are editing their own files at the same time; if the smoke run shows errors in someone
   else's module, ignore them. Only edit the files you own.
+
+## 8. Additions after integration
+
+- `G.raft.busy` (runtime, set by raft.js): true while a raft cutscene runs (sail-around, sleep). The player
+  module ignores movement/tool input while it is true, and saves are refused.
+- `swallowInput()` (core/input.js): a menu that consumes Space/Enter calls it so the key doesn't also make
+  the boy jump after the menu closes.
+- `hint(keyboardText, touchText)` (core/input.js): pick control wording for keyboard vs touchscreen players.
+  Every toast that names a key must use it (e.g. hint('按 F 吃东西', '点「吃」吃东西')).
+- Saving: `isSafeToSave(G)` (core/save.js). Autosave happens at the first safe moment after a new day starts.
+  `api.save()` returns false when it is not safe; the HUD must then say why.
+- After the ending, returning to the title deletes the save (the journey is finished).

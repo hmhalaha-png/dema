@@ -308,6 +308,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     // last input came from a touchscreen
   };
   var held = { left: /* @__PURE__ */ new Set(), right: /* @__PURE__ */ new Set(), up: /* @__PURE__ */ new Set(), down: /* @__PURE__ */ new Set(), use: /* @__PURE__ */ new Set() };
+  var swallowed = /* @__PURE__ */ new Set();
   function setHeld(name, src, on) {
     const s = held[name];
     if (on) s.add(src);
@@ -335,6 +336,15 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     window.addEventListener("keydown", (e) => {
       if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
       input.touch = false;
+      if (e.code === "Tab") {
+        e.preventDefault();
+        if (!e.repeat) input.craftPressed = true;
+        return;
+      }
+      if (swallowed.has(e.code)) {
+        e.preventDefault();
+        return;
+      }
       const k = KEYMAP[e.code];
       if (k) {
         setHeld(k, "key:" + e.code, true);
@@ -349,10 +359,8 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         case "KeyQ":
           input.cyclePressed = true;
           break;
-        case "Tab":
         case "KeyC":
           input.craftPressed = true;
-          e.preventDefault();
           break;
         case "KeyJ":
           input.journalPressed = true;
@@ -376,6 +384,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       }
     });
     window.addEventListener("keyup", (e) => {
+      swallowed.delete(e.code);
       const k = KEYMAP[e.code];
       if (k) setHeld(k, "key:" + e.code, false);
     });
@@ -20152,6 +20161,15 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       return false;
     }
   }
+  function isSafeToSave(G2) {
+    const P = G2.player;
+    if (!P || G2.demo || G2.mode !== "play" && G2.mode !== "pause" && G2.mode !== "panel") return false;
+    if (P.dead || P.hp <= 25 || P.underwater || P.inWater) return false;
+    if (G2.fade > 0.01 || G2.raft && G2.raft.busy) return false;
+    if (P.onIsland && G2.phase >= C.NIGHT_START - 0.04 && G2.phase < C.NIGHT_END) return false;
+    if (G2.beasts && G2.beasts.some((b) => b && b.st !== "hide" && b.st !== "flee" && Math.abs(b.x - P.x) < 500)) return false;
+    return true;
+  }
   function saveGame(G2) {
     if (G2.demo || G2.mode === "dead") return false;
     try {
@@ -20175,6 +20193,15 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       Object.assign(G2.player, data.player || {});
       G2.player.vx = 0;
       G2.player.vy = 0;
+      const P = G2.player;
+      P.hp = Math.max(P.hp || 0, 30);
+      P.hunger = Math.max(P.hunger || 0, 15);
+      P.thirst = Math.max(P.thirst || 0, 15);
+      P.oxygen = 100;
+      if (!(P.y < 2)) {
+        P.x = G2.raft.x + G2.raft.tiles.length * C.TILE_W / 2;
+        P.y = -C.DECK_H;
+      }
       G2.persist = Object.assign({ islands: {}, flags: {} }, G2.persist || {});
       G2.inv = Object.assign(newGame().inv, G2.inv || {});
       syncTime(G2);
@@ -27535,11 +27562,16 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       run("hud.onStart", () => onStart && onStart(G, "continue"));
       snapCamera();
     },
+    // Manual save (pause menu). Returns false when the boy is somewhere unsafe — the HUD should
+    // then tell the player to get back to the raft first, so a reload never lands in a death.
     save() {
-      return G ? saveGame(G) : false;
+      return G && isSafeToSave(G) ? saveGame(G) : false;
     },
     toTitle() {
-      if (G && !G.demo && G.mode !== "dead") saveGame(G);
+      if (G && !G.demo) {
+        if (G.mode === "ending") deleteSave();
+        else if (G.mode !== "dead" && isSafeToSave(G)) saveGame(G);
+      }
       G = makeDemo();
       snapCamera();
     },
@@ -27613,7 +27645,11 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     run("craft.update", () => update9 && update9(G, dt));
     run("particles", () => updateParticles(G, dt, waterY));
     G.hits.length = 0;
-    if (!demo && G.day !== prevDay) saveGame(G);
+    if (!demo && G.day !== prevDay) G.pendingSave = true;
+    if (!demo && G.pendingSave && isSafeToSave(G)) {
+      G.pendingSave = false;
+      saveGame(G);
+    }
   }
   function render() {
     const v = G.view, d = v.dpr;
@@ -27683,7 +27719,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     window.addEventListener("resize", () => resize2());
     document.addEventListener("visibilitychange", () => {
       if (document.hidden && G && G.mode === "play") {
-        saveGame(G);
+        if (isSafeToSave(G)) saveGame(G);
         G.mode = "pause";
       }
     });

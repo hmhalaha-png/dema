@@ -20,6 +20,7 @@ export const input = {
 };
 
 const held = { left: new Set(), right: new Set(), up: new Set(), down: new Set(), use: new Set() };
+const swallowed = new Set();   // key codes ignored until released (see swallowInput)
 function setHeld(name, src, on) {
   const s = held[name];
   if (on) s.add(src); else s.delete(src);
@@ -41,13 +42,15 @@ export function initInput(canvas) {
   window.addEventListener('keydown', (e) => {
     if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
     input.touch = false;
+    if (e.code === 'Tab') { e.preventDefault(); if (!e.repeat) input.craftPressed = true; return; }
+    if (swallowed.has(e.code)) { e.preventDefault(); return; }
     const k = KEYMAP[e.code];
     if (k) { setHeld(k, 'key:' + e.code, true); e.preventDefault(); return; }
     if (e.repeat) return;
     switch (e.code) {
       case 'KeyE': input.interactPressed = true; break;
       case 'KeyQ': input.cyclePressed = true; break;
-      case 'Tab': case 'KeyC': input.craftPressed = true; e.preventDefault(); break;
+      case 'KeyC': input.craftPressed = true; break;
       case 'KeyJ': input.journalPressed = true; break;
       case 'Escape': case 'KeyP': input.pausePressed = true; break;
       case 'KeyF': input.eatPressed = true; break;
@@ -57,6 +60,7 @@ export function initInput(canvas) {
     }
   });
   window.addEventListener('keyup', (e) => {
+    swallowed.delete(e.code);
     const k = KEYMAP[e.code];
     if (k) setHeld(k, 'key:' + e.code, false);
   });
@@ -123,6 +127,22 @@ export function tap(key) {
       if (key && key.startsWith('tool')) input.toolPressed = Number(key.slice(4)) || 0;
   }
 }
+
+// Call when a menu/screen consumes a key press (e.g. Space or Enter on 继续): releases every
+// held key and ignores the keys still physically down until they are released, so closing a
+// menu with Space doesn't also make the boy jump.
+export function swallowInput() {
+  for (const name of Object.keys(held)) {
+    for (const src of held[name]) if (src.startsWith('key:')) swallowed.add(src.slice(4));
+    held[name].clear(); input[name] = false;
+  }
+  swallowed.add('Space'); swallowed.add('Enter'); swallowed.add('NumpadEnter');
+  endInputFrame();
+}
+
+// Pick the right wording for a control hint: keyboard text, or the touch-button text when the
+// player is using a touchscreen. Example: hint('按 F 吃东西', '点「吃」吃东西').
+export const hint = (keyboard, touch) => (input.touch ? touch : keyboard);
 
 // Called by the core once per rendered frame after gameplay has read input.
 export function endInputFrame() {
