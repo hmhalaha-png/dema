@@ -158,24 +158,28 @@ function pn1(x, period, seed) {
   return a + (b - a) * u;
 }
 function boxBlur(src, w, h, r) {
-  const tmp = new Float32Array(src.length), out = new Float32Array(src.length);
+  const n = src.length, tmp = new Float32Array(n), out = new Float32Array(n);
   const inv = 1 / (2 * r + 1);
   for (let y = 0; y < h; y++) {
     const row = y * w;
     let acc = 0;
-    for (let x = -r; x <= r; x++) acc += src[row + clamp(x, 0, w - 1)];
+    for (let x = -r; x <= r; x++) acc += src[row + (x < 0 ? 0 : x >= w ? w - 1 : x)];
     for (let x = 0; x < w; x++) {
       tmp[row + x] = acc * inv;
-      acc += src[row + Math.min(w - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
+      const xa = x + r + 1, xb = x - r;
+      acc += src[row + (xa < w ? xa : w - 1)] - src[row + (xb > 0 ? xb : 0)];
     }
   }
-  for (let x = 0; x < w; x++) {
-    let acc = 0;
-    for (let y = -r; y <= r; y++) acc += tmp[clamp(y, 0, h - 1) * w + x];
-    for (let y = 0; y < h; y++) {
-      out[y * w + x] = acc * inv;
-      acc += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
-    }
+  // vertical pass row by row (cache friendly), one running sum per column
+  const acc = new Float64Array(w);
+  for (let y = -r; y <= r; y++) {
+    const row = (y < 0 ? 0 : y >= h ? h - 1 : y) * w;
+    for (let x = 0; x < w; x++) acc[x] += tmp[row + x];
+  }
+  for (let y = 0; y < h; y++) {
+    const o = y * w, ya = y + r + 1, yb = y - r;
+    const ra = (ya < h ? ya : h - 1) * w, rb = (yb > 0 ? yb : 0) * w;
+    for (let x = 0; x < w; x++) { out[o + x] = acc[x] * inv; acc[x] += tmp[ra + x] - tmp[rb + x]; }
   }
   return out;
 }
@@ -198,8 +202,17 @@ function maskCanvas(w, h, arr) {
 const SPR = {
   built: false, scratch: null, sctx: null,
   far: [], mid: [], high: [], cirrus: [], fog: [], shafts: null,
-  moon: null, glint: null, rays: null, mtnBack: null, mtnFront: null, stars: null,
+  moon: null, beam: null, glint: null, rays: null, mtnBack: null, mtnFront: null, stars: null,
 };
+// [set, slot, bake now?, kind, seed, w, h, rim glow]
+const CLOUD_JOBS = [
+  ['mid', 0, true, 'tower', 101, 640, 440, true], ['far', 0, true, 'far', 606, 360, 130, false], ['high', 0, true, 'deck', 1111, 780, 210, true],
+  ['mid', 2, false, 'heap', 303, 620, 300, true], ['mid', 5, false, 'twin', 2121, 700, 430, true], ['high', 1, false, 'deck', 1212, 680, 190, true],
+  ['far', 1, false, 'far', 707, 300, 110, false], ['mid', 1, false, 'tower', 202, 560, 410, true], ['mid', 3, false, 'heap', 404, 520, 270, true],
+  ['far', 2, false, 'far', 808, 420, 125, false], ['mid', 6, false, 'mound', 2222, 600, 330, true], ['high', 2, false, 'deck', 1313, 860, 230, true],
+  ['mid', 4, false, 'heap', 505, 700, 280, true], ['far', 3, false, 'far', 909, 260, 100, false], ['mid', 7, false, 'tower', 2323, 500, 470, true],
+];
+const BAKE = { queue: [], gen: null };
 const tintables = [];
 let tintCursor = 0;
 let lastSkySig = null;
@@ -225,17 +238,18 @@ function tickPresence() {
   if (presFrame % 180 === 0) for (const [k, e] of cellPres) if (presFrame - e.f > 90) cellPres.delete(k);
 }
 
-// A cumulus cloud from many overlapping spherical lobes, z-buffered and lit
-// from above; produces masks (body, lit, highlight, rim) that are re-tinted
-// cheaply on the GPU whenever the time of day changes.
-function bakeCloud(kind, seed, wU, hU, withRimC) {
-  const w = Math.round(wU * RS), h = Math.round(hU * RS);
-  const R = seeded(seed);
-  const rr = (a, b) => a + (b - a) * R();
-  const base = h * (kind === 'deck' ? 0.78 : 0.86);
-  const maxThick = base - h * 0.04;
+// Light set-ups for the cloud bake. 0: high light (day sun, night moon); 1: a low sun to
+// the LEFT of the cloud; 2: a low sun to the RIGHT. `l` points toward the light in 3D
+// (screen y down, z toward the viewer), `m` is the 2D direction the shadow march takes.
+const LIT_A = 0.2, LIT_B = 0.5, HI_A = 0.46, HI_B = 0.76;   // luminance ramps of the cloud masks
+const CLOUD_LIGHTS = [
+  { l: [-0.27, -0.9, 0.34], m: [-0.27, -0.96] },
+  { l: [-0.86, -0.36, 0.36], m: [-0.92, -0.39] },
+  { l: [0.86, -0.36, 0.36], m: [0.92, -0.39] },
+];
 
-  // silhouette envelope: a few towers / heaps
+// Silhouette envelope of a cloud: gaussian bumps [centre, width, height] along x.
+function cloudBumps(kind, rr, R) {
   const bumps = [];
   if (kind === 'tower') {
     const c = rr(0.42, 0.58);
@@ -243,6 +257,13 @@ function bakeCloud(kind, seed, wU, hU, withRimC) {
     bumps.push([c + rr(-0.27, -0.18), rr(0.09, 0.13), rr(0.42, 0.6)]);
     bumps.push([c + rr(0.16, 0.27), rr(0.09, 0.13), rr(0.48, 0.68)]);
     bumps.push([c + rr(-0.05, 0.05), rr(0.24, 0.3), rr(0.28, 0.36)]);
+  } else if (kind === 'twin') {
+    const a = rr(0.27, 0.35), b = rr(0.62, 0.7);
+    bumps.push([a, rr(0.1, 0.13), 1], [b, rr(0.09, 0.12), rr(0.6, 0.76)], [(a + b) / 2, rr(0.2, 0.26), rr(0.3, 0.38)]);
+    bumps.push([a - rr(0.13, 0.18), rr(0.06, 0.09), rr(0.3, 0.42)], [b + rr(0.13, 0.18), rr(0.06, 0.09), rr(0.26, 0.38)]);
+  } else if (kind === 'mound') {
+    bumps.push([rr(0.45, 0.55), rr(0.16, 0.2), 1], [rr(0.24, 0.31), rr(0.09, 0.12), rr(0.5, 0.64)], [rr(0.69, 0.77), rr(0.09, 0.12), rr(0.46, 0.62)]);
+    bumps.push([0.5, 0.36, 0.3]);
   } else if (kind === 'heap') {
     const n = 3 + ((R() * 2) | 0);
     for (let i = 0; i < n; i++) bumps.push([rr(0.2, 0.8), rr(0.08, 0.15), rr(0.45, 1)]);
@@ -256,6 +277,32 @@ function bakeCloud(kind, seed, wU, hU, withRimC) {
     for (let i = 0; i < n; i++) bumps.push([rr(0.1, 0.9), rr(0.05, 0.1), rr(0.4, 1)]);
     bumps.push([0.5, 0.4, 0.45]);
   }
+  return bumps;
+}
+
+// Blur of `val` weighted by coverage, so edges keep their own value instead of fading
+// toward the empty sky around them.
+function coverageBlur(val, cov, w, h, r) {
+  const n = val.length, vw = new Float32Array(n);
+  for (let i = 0; i < n; i++) vw[i] = val[i] * cov[i];
+  const a = boxBlur(boxBlur(vw, w, h, r), w, h, r), c = boxBlur(boxBlur(cov, w, h, r), w, h, r);
+  for (let i = 0; i < n; i++) a[i] = c[i] > 1e-4 ? a[i] / c[i] : 0;
+  return a;
+}
+
+// A cumulus cloud from many overlapping, slightly lumpy lobes. Their normals are blended
+// with a soft-max on depth (no hard seams between lobes), lit by a half-lambert term times
+// the light that survives a march through the cloud mass toward the light. Masks for three
+// light directions (high, low-left, low-right) are kept as bytes and tinted on the CPU.
+function* bakeCloudGen(kind, seed, wU, hU, withRimC) {
+  const w = Math.round(wU * RS), h = Math.round(hU * RS);
+  const R = seeded(seed);
+  const rr = (a, b) => a + (b - a) * R();
+  const deck = kind === 'deck';
+  const base = h * (deck ? 0.78 : 0.86);
+  const maxThick = base - h * 0.04;
+
+  const bumps = cloudBumps(kind, rr, R);
   const thick = new Float32Array(w);
   for (let x = 0; x < w; x++) {
     const fx = x / w;
@@ -266,16 +313,27 @@ function bakeCloud(kind, seed, wU, hU, withRimC) {
   }
   const thickAt = (x) => thick[clamp(x | 0, 0, w - 1)];
   const minR = Math.max(3, h * 0.025);
-  const maxR = h * (kind === 'tower' ? 0.19 : kind === 'deck' ? 0.3 : 0.24);
+  const maxR = h * (kind === 'tower' || kind === 'twin' ? 0.19 : deck ? 0.3 : 0.24);
   const x0 = w * 0.06, x1 = w * 0.94;
   const lobes = [];
+  // lobe sizes vary in patches, and every lobe is a little lumpy (not a perfect ball)
+  const jit = (x, y) => 0.78 + 0.44 * vn2(x * 0.04, y * 0.04, seed + 31);
+  const lobe = (x, y, r, z, tone, surf) => {
+    const a2 = rr(0.02, 0.07), a3 = rr(0.015, 0.05), a5 = rr(0.01, 0.035);
+    const p2 = rr(0, TAU), p3 = rr(0, TAU), p5 = rr(0, TAU);
+    lobes.push({
+      x, y, r, z, tone, surf,
+      c2: a2 * Math.cos(p2), s2: a2 * Math.sin(p2), c3: a3 * Math.cos(p3), s3: a3 * Math.sin(p3),
+      c5: a5 * Math.cos(p5), s5: a5 * Math.sin(p5), wm: a2 + a3 + a5,
+    });
+  };
   // surface billows that make the silhouette
   for (let x = x0; x < x1;) {
     const t = thickAt(x);
     if (t < minR * 1.5) { x += minR; continue; }
-    const r = clamp(t * rr(0.2, 0.34), minR, maxR);
+    const r = clamp(t * rr(0.2, 0.34) * jit(x, base - t), minR, maxR);
     const cx = x + rr(-0.2, 0.2) * r;
-    lobes.push({ x: cx, y: base - thickAt(cx) + r * rr(0.82, 1.0), r, z: rr(0, 0.15) * t, tone: rr(-0.05, 0.05), surf: true });
+    lobe(cx, base - thickAt(cx) + r * rr(0.82, 1.0), r, rr(0, 0.15) * t, rr(-0.05, 0.05), true);
     x += r * rr(0.62, 0.95);
   }
   // body lobes: lower ones sit in front, which stacks the cauliflower
@@ -283,17 +341,17 @@ function bakeCloud(kind, seed, wU, hU, withRimC) {
   for (let i = 0; i < nBody; i++) {
     const cx = rr(x0, x1), t = thickAt(cx);
     if (t < minR * 2) continue;
-    const r = clamp(t * rr(0.24, 0.42), minR, maxR * 1.05);
     const top = base - t;
+    const r = clamp(t * rr(0.24, 0.42), minR, maxR * 1.05);
     const cy = rr(top + r * 1.15, base - r * 0.1);
     const depth = (cy - top) / t;
-    lobes.push({ x: cx, y: cy, r, z: depth * t * 0.55 + rr(0, 0.12) * t, tone: rr(-0.06, 0.04) });
+    lobe(cx, cy, clamp(r * jit(cx, cy), minR, maxR * 1.05), depth * t * 0.55 + rr(0, 0.12) * t, rr(-0.06, 0.04), false);
   }
   // flat base row
   for (let x = x0; x < x1;) {
     const t = thickAt(x);
     const r = clamp(t * rr(0.25, 0.4), minR, maxR);
-    if (t > minR) lobes.push({ x, y: base - r * 0.35, r, z: t * rr(0.4, 0.6), tone: -0.04 });
+    if (t > minR) lobe(x, base - r * 0.35, r, t * rr(0.4, 0.6), -0.04, false);
     x += r * rr(0.8, 1.2);
   }
   // cauliflower detail on the billows
@@ -301,40 +359,68 @@ function bakeCloud(kind, seed, wU, hU, withRimC) {
   for (let i = 0; i < nSurf; i++) {
     const L = lobes[i];
     if (!L.surf) continue;
-    const n = 2 + ((R() * 3) | 0);
+    const n = 3 + ((R() * 3) | 0);
     for (let k = 0; k < n; k++) {
-      const a = rr(-Math.PI * 0.92, -Math.PI * 0.08);
-      const d = L.r * rr(0.62, 0.86);
-      lobes.push({ x: L.x + Math.cos(a) * d, y: L.y + Math.sin(a) * d, r: Math.max(2, L.r * rr(0.22, 0.42)), z: L.z + L.r * 0.5, tone: rr(-0.02, 0.06) });
+      const a = rr(-Math.PI * 0.95, -Math.PI * 0.05);
+      const d = L.r * rr(0.6, 0.88);
+      lobe(L.x + Math.cos(a) * d, L.y + Math.sin(a) * d, Math.max(2, L.r * rr(0.2, 0.42)), L.z + L.r * 0.5, rr(-0.02, 0.06), false);
     }
   }
 
-  // rasterize spheres into a z-buffer
+  yield;
+  // rasterize in one pass: coverage, the front-most lobe, and a soft-max (online log-sum-exp
+  // over depth) blend of the lobe normals so lobes melt into each other without seams
   const N = w * h;
   const zb = new Float32Array(N).fill(-1e9);
   const idb = new Int32Array(N).fill(-1);
   const cov = new Float32Array(N);
+  const sW = new Float32Array(N), sX = new Float32Array(N), sY = new Float32Array(N), sZ = new Float32Array(N);
+  const invKz = 1 / Math.max(1.5, maxR * 0.08);
   for (let li = 0; li < lobes.length; li++) {
+    if ((li & 31) === 31) yield;
     const L = lobes[li];
-    const R1 = L.r + 1, R12 = R1 * R1, r2 = L.r * L.r;
-    const xa = Math.max(0, Math.floor(L.x - R1)), xb = Math.min(w - 1, Math.ceil(L.x + R1));
-    const ya = Math.max(0, Math.floor(L.y - R1)), yb = Math.min(h - 1, Math.ceil(L.y + R1));
+    const lx = L.x, ly = L.y, lr = L.r, lz = L.z, ir = 1 / lr;
+    const k2c = L.c2, k2s = L.s2, k3c = L.c3, k3s = L.s3, k5c = L.c5, k5s = L.s5;
+    const R1 = lr * (1 + L.wm) + 1, R12 = R1 * R1;
+    const xa = Math.max(0, Math.floor(lx - R1)), xb = Math.min(w - 1, Math.ceil(lx + R1));
+    const ya = Math.max(0, Math.floor(ly - R1)), yb = Math.min(h - 1, Math.ceil(ly + R1));
     for (let y = ya; y <= yb; y++) {
-      const dy = y + 0.5 - L.y;
+      const dy = y + 0.5 - ly;
       for (let x = xa; x <= xb; x++) {
-        const dx = x + 0.5 - L.x;
+        const dx = x + 0.5 - lx;
         const d2 = dx * dx + dy * dy;
         if (d2 >= R12) continue;
+        const d = Math.sqrt(d2);
+        let rad = lr;
+        if (d > 1e-3) {
+          const id = 1 / d, c = dx * id, s = dy * id;
+          const c2 = c * c - s * s, s2 = 2 * s * c;
+          const c3 = c * (4 * c * c - 3), s3 = s * (3 - 4 * s * s);
+          const c4 = c2 * c2 - s2 * s2, s4 = 2 * s2 * c2;
+          rad *= 1 + k2c * c2 + k2s * s2 + k3c * c3 + k3s * s3 + k5c * (c4 * c - s4 * s) + k5s * (s4 * c + c4 * s);
+        }
+        const e = rad - d + 0.5;
+        if (e <= 0) continue;
         const i = y * w + x;
-        const e = L.r - Math.sqrt(d2) + 0.5;
-        const ec = e > 1 ? 1 : e;
-        if (ec > cov[i]) cov[i] = ec;
-        const z = d2 < r2 ? L.z + Math.sqrt(r2 - d2) : L.z;
-        if (z > zb[i]) { zb[i] = z; idb[i] = li; }
+        if (e > cov[i]) cov[i] = e > 1 ? 1 : e;
+        if (d >= rad) continue;
+        const hz = Math.sqrt(rad * rad - d2), z = lz + hz;
+        const nx = dx * ir, ny = dy * ir, nz = hz * ir;
+        const m = zb[i];
+        if (z > m) {
+          const sc = m > -1e8 ? Math.exp((m - z) * invKz) : 0;
+          sW[i] = sW[i] * sc + 1; sX[i] = sX[i] * sc + nx; sY[i] = sY[i] * sc + ny; sZ[i] = sZ[i] * sc + nz;
+          zb[i] = z; idb[i] = li;
+        } else {
+          const wt = Math.exp((z - m) * invKz);
+          if (wt < 0.004) continue;
+          sW[i] += wt; sX[i] += wt * nx; sY[i] += wt * ny; sZ[i] += wt * nz;
+        }
       }
     }
   }
-  // per-column top (for self-shadowing depth)
+  yield;
+  // per-column top (for the belly / depth terms)
   const colTop = new Float32Array(w);
   let cloudTop = h;
   for (let x = 0; x < w; x++) {
@@ -344,74 +430,169 @@ function bakeCloud(kind, seed, wU, hU, withRimC) {
     if (t < cloudTop) cloudTop = t;
   }
   const colTopS = boxBlur(colTop, w, 1, Math.max(2, Math.round(maxR * 0.35)));
-  const covB = boxBlur(cov, w, h, 2);
-  // large-scale volume: a heavily blurred silhouette gives a "pillow" normal
-  // that holds the lobes together into one mass
+  const covS = boxBlur(cov, w, h, 1);                       // soft outline, no stair steps when scaled
+  const covB = boxBlur(boxBlur(covS, w, h, 2), w, h, 2);    // the band just inside the silhouette
+  // large-scale volume: a heavily blurred silhouette gives a "pillow" normal that holds the
+  // lobes together into one mass
   const gb = Math.max(3, Math.round(maxR * 0.5));
   const covL = boxBlur(boxBlur(cov, w, h, gb), w, h, gb);
   const gk = gb * 2.4;
   const span = Math.max(1, base - cloudTop);
+  yield;
+  // creases: where a lobe sits deeper than its neighbours it is tucked under them (soft AO)
+  const zf = new Float32Array(N);
+  for (let i = 0; i < N; i++) zf[i] = idb[i] >= 0 ? zb[i] : 0;
+  const zAvg = coverageBlur(zf, cov, w, h, Math.max(2, Math.round(maxR * 0.25)));
+  const creaseK = 1 / Math.max(2, maxR * 0.4);
 
-  // shade
-  let lx = -0.25, ly = -0.88, lz = 0.4;
-  const ln = 1 / Math.hypot(lx, ly, lz); lx *= ln; ly *= ln; lz *= ln;
-  const nf = 1 / (maxR * 0.45);
-  const lumA = new Float32Array(N), rim = new Float32Array(N);
+  yield;
+  // low-resolution helpers: light that survives the trip through the cloud toward each
+  // light (a short march through the coverage), and smooth noise for the painterly wobble
+  const f = 3, lw = Math.ceil(w / f), lh = Math.ceil(h / f), nLo = lw * lh;
+  const covLo = new Float32Array(nLo);
+  const inv9 = 1 / (f * f);
   for (let y = 0; y < h; y++) {
-    const yu = Math.max(0, y - 1) * w, yd = Math.min(h - 1, y + 1) * w;
+    const ro = ((y / f) | 0) * lw, row = y * w;
+    for (let x = 0; x < w; x++) covLo[ro + ((x / f) | 0)] += cov[row + x] * inv9;
+  }
+  const dScale = Math.max(3, (h * 0.26) / f), stepL = 1.5;
+  const trans = CLOUD_LIGHTS.map((Lt) => {
+    const T = new Float32Array(nLo).fill(1);
+    const M = Math.min(60, Math.ceil((dScale * 3) / stepL)), mx = Lt.m[0] * stepL, my = Lt.m[1] * stepL;
+    for (let y = 0; y < lh; y++) {
+      for (let x = 0; x < lw; x++) {
+        const k = y * lw + x;
+        if (covLo[k] <= 0) continue;
+        let px = x + 0.5, py = y + 0.5, s = covLo[k] * 0.5;
+        for (let j = 0; j < M; j++) {
+          px += mx; py += my;
+          if (px < 0 || py < 0 || px >= lw || py >= lh) break;
+          s += covLo[(py | 0) * lw + (px | 0)];
+        }
+        T[k] = Math.exp((-s * stepL) / dScale);
+      }
+    }
+    return T;
+  });
+  const nfq = f / (maxR * 0.45);
+  const noiseLo = [new Float32Array(nLo), new Float32Array(nLo), new Float32Array(nLo)];
+  for (let y = 0; y < lh; y++) {
+    for (let x = 0; x < lw; x++) {
+      const k = y * lw + x;
+      noiseLo[0][k] = vn2(x * nfq, y * nfq, seed) - 0.5;
+      noiseLo[1][k] = vn2(x * nfq + 17.3, y * nfq + 5.1, seed + 3) - 0.5;
+      noiseLo[2][k] = vn2(x * f * 0.06, y * f * 0.035, seed + 9) - 0.5;
+    }
+  }
+  const invf = 1 / f;
+  const lo = (T, x, y) => {
+    let fx = (x + 0.5) * invf - 0.5, fy = (y + 0.5) * invf - 0.5;
+    fx = fx < 0 ? 0 : fx > lw - 1.001 ? lw - 1.001 : fx;
+    fy = fy < 0 ? 0 : fy > lh - 1.001 ? lh - 1.001 : fy;
+    const ix = fx | 0, iy = fy | 0, tx = fx - ix, ty = fy - iy, k = iy * lw + ix;
+    const k1 = ix + 1 < lw ? k + 1 : k, k2 = iy + 1 < lh ? k + lw : k, k3 = ix + 1 < lw ? k2 + 1 : k2;
+    const a = T[k] + (T[k1] - T[k]) * tx, b = T[k2] + (T[k3] - T[k2]) * tx;
+    return a + (b - a) * ty;
+  };
+
+  yield;
+  // shade
+  const lum = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
+  const rimF = [new Float32Array(N), new Float32Array(N), new Float32Array(N)];
+  const LL = CLOUD_LIGHTS;
+  for (let y = 0; y < h; y++) {
+    if ((y & 15) === 15) yield;
+    const yu = Math.max(0, y - 1) * w, yd = Math.min(h - 1, y + 1) * w, row = y * w;
+    const vy = (y - cloudTop) / span;
+    const belly = smoothstep(0.5, 1.05, vy);
     for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      if (cov[i] <= 0 || idb[i] < 0) continue;
-      const L = lobes[idb[i]];
-      let nx = (x + 0.5 - L.x) / L.r, ny = (y + 0.5 - L.y) / L.r;
-      const q = 1 - nx * nx - ny * ny;
-      let nz = q > 0 ? Math.sqrt(q) : 0;
-      const rimL = Math.pow(1 - nz, 3) * clamp(-ny * 1.15 - nx * 0.3 + 0.05, 0, 1);
-      // global pillow normal
-      let gx = -(covL[y * w + Math.min(w - 1, x + 1)] - covL[y * w + Math.max(0, x - 1)]) * gk;
-      let gy = -(covL[yd + x] - covL[yu + x]) * gk;
+      const i = row + x;
+      if (cov[i] <= 0) continue;
+      const xl = row + (x > 0 ? x - 1 : 0), xr = row + (x < w - 1 ? x + 1 : x);
+      let nx = 0, ny = 0, nz = 1;
+      if (sW[i] > 0) { const q = 1 / sW[i]; nx = sX[i] * q; ny = sY[i] * q; nz = sZ[i] * q; }
+      const gx = -(covL[xr] - covL[xl]) * gk, gy = -(covL[yd + x] - covL[yu + x]) * gk;
       const gl = 1 / Math.sqrt(gx * gx + gy * gy + 1);
-      // blend lobe and volume normals, then a painterly wobble
-      nx = nx * 0.42 + gx * gl * 0.58 + (vn2(x * nf, y * nf, seed) - 0.5) * 0.5;
-      ny = ny * 0.42 + gy * gl * 0.58 + (vn2(x * nf + 17.3, y * nf + 5.1, seed + 3) - 0.5) * 0.4;
-      nz = nz * 0.42 + gl * 0.58;
+      nx = nx * 0.5 + gx * gl * 0.5 + lo(noiseLo[0], x, y) * 0.45;
+      ny = ny * 0.5 + gy * gl * 0.5 + lo(noiseLo[1], x, y) * 0.35;
+      nz = nz * 0.5 + gl * 0.5;
       const inv = 1 / Math.sqrt(nx * nx + ny * ny + nz * nz + 1e-6);
       nx *= inv; ny *= inv; nz *= inv;
-      let l = 0.5 + 0.5 * (nx * lx + ny * ly + nz * lz);
       const depth = clamp((y - colTopS[x]) / span, 0, 1);
-      l *= 1 - 0.6 * smoothstep(0.04, 0.9, depth);
-      const vy = (y - cloudTop) / span;
-      l *= 1 - 0.3 * smoothstep(0.5, 1.05, vy);
-      l += L.tone * 0.6 + (vn2(x * 0.06, y * 0.035, seed + 9) - 0.5) * 0.12 + (vn2(x * 0.2, y * 0.12, seed + 4) - 0.5) * 0.05;
-      lumA[i] = l;
-      const rs = smoothstep(0.04, 0.55, 1 - covB[i]) * clamp(0.8 - ny, 0, 1) * (1 - 0.6 * vy);
-      rim[i] = Math.max(rimL * (1 - 0.75 * depth), rs);
+      const crease = idb[i] >= 0 ? clamp((zAvg[i] - zb[i]) * creaseK, 0, 1) : 0;
+      const shade = (1 - 0.16 * smoothstep(0.15, 0.9, depth)) * (1 - 0.32 * crease);
+      const tone = (idb[i] >= 0 ? lobes[idb[i]].tone * 0.5 : 0) + lo(noiseLo[2], x, y) * 0.1;
+      // silhouette band and which way it faces
+      const edge = smoothstep(0.08, 0.5, 1 - covB[i]);
+      let ox = 0, oy = 0;
+      if (edge > 0.002) {
+        ox = covB[xl] - covB[xr]; oy = covB[yu + x] - covB[yd + x];
+        const ol = Math.sqrt(ox * ox + oy * oy);
+        if (ol > 1e-6) { ox /= ol; oy /= ol; } else { ox = 0; oy = 0; }
+      }
+      for (let v = 0; v < 3; v++) {
+        const Lt = LL[v];
+        const T = lo(trans[v], x, y);
+        const lam = nx * Lt.l[0] + ny * Lt.l[1] + nz * Lt.l[2];
+        const l = (0.5 + 0.5 * lam) * (0.3 + 0.7 * T) * (1 - (v ? 0.22 : 0.3) * belly) * shade;
+        lum[v][i] = l + tone;
+        if (edge > 0.002) {
+          const face = (ox * Lt.m[0] + oy * Lt.m[1]) * 1.25 + 0.05;
+          if (face > 0) rimF[v][i] = edge * (face > 1 ? 1 : face) * (0.3 + 0.7 * T) * (1 - 0.8 * belly);
+        }
+      }
     }
   }
-  const lumB = boxBlur(lumA, w, h, 1);
-  const body = new Float32Array(N), lit = new Float32Array(N), hi = new Float32Array(N);
-  const fadeA = base - h * (kind === 'deck' ? 0.14 : 0.09), fadeB = base + h * 0.08;
+  yield;
+  const body = new Uint8Array(N);
+  const fadeA = base - h * (deck ? 0.14 : 0.09), fadeB = base + h * 0.08;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = y * w + x;
-      if (cov[i] <= 0) continue;
+      if (covS[i] <= 0) continue;
       const n = (vn2(x * 0.03, y * 0.02, seed + 21) - 0.5) * h * 0.16;
-      const bf = 1 - smoothstep(fadeA, fadeB, y + n);
-      body[i] = cov[i] * bf;
-      const l = lumB[i];
-      lit[i] = smoothstep(0.4, 0.54, l);
-      hi[i] = smoothstep(0.62, 0.74, l);
-      rim[i] = clamp(rim[i], 0, 1);
+      body[i] = 255 * covS[i] * (1 - smoothstep(fadeA, fadeB, y + n));
     }
   }
+  const lit = [], hi = [], rim = [];
+  const covW = boxBlur(boxBlur(cov, w, h, 2), w, h, 2);
+  for (let v = 0; v < 3; v++) {
+    yield;
+    const lv = lum[v];
+    for (let i = 0; i < N; i++) lv[i] *= cov[i];
+    const lb = boxBlur(boxBlur(lv, w, h, 2), w, h, 2), rf = rimF[v];
+    const L8 = new Uint8Array(N), H8 = new Uint8Array(N), R8 = new Uint8Array(N);
+    for (let i = 0; i < N; i++) {
+      if (!body[i]) continue;
+      const l = covW[i] > 1e-4 ? lb[i] / covW[i] : 0;
+      L8[i] = 255 * smoothstep(LIT_A, LIT_B, l);
+      H8[i] = 255 * smoothstep(HI_A, HI_B, l);
+      R8[i] = 255 * (rf[i] > 1 ? 1 : rf[i]);
+    }
+    lit.push(L8); hi.push(H8); rim.push(R8);
+  }
   const spr = {
-    w, h, baseFrac: base / h, kind,
-    body: maskCanvas(w, h, body), lit: maskCanvas(w, h, lit), hi: maskCanvas(w, h, hi), rim: maskCanvas(w, h, rim),
-    tinted: makeCanvas(w, h), rimC: withRimC ? makeCanvas(w, h) : null,
+    w, h, baseFrac: base / h, kind, body, lit, hi, rim, sideK: 0,
+    img: new ImageData(w, h),
+    tinted: [makeCanvas(w, h), makeCanvas(w, h)],
+    rimC: withRimC ? [makeCanvas(w, h), makeCanvas(w, h)] : null,
   };
-  spr.tctx = spr.tinted.getContext('2d');
-  spr.rctx = spr.rimC ? spr.rimC.getContext('2d') : null;
+  spr.tctx = spr.tinted.map((c) => c.getContext('2d'));
+  spr.rctx = spr.rimC ? spr.rimC.map((c) => c.getContext('2d')) : null;
   return spr;
+}
+
+function bakeCloud(kind, seed, wU, hU, withRimC) {
+  const g = bakeCloudGen(kind, seed, wU, hU, withRimC);
+  let r;
+  do { r = g.next(); } while (!r.done);
+  return r.value;
+}
+
+// Coverage (0..1) of a cloud sprite at a fractional position inside it.
+function cloudBodyAt(spr, fx, fy) {
+  if (!(fx >= 0 && fy >= 0 && fx < 1 && fy < 1)) return 0;
+  return spr.body[((fy * spr.h) | 0) * spr.w + ((fx * spr.w) | 0)] / 255;
 }
 
 // Thin high cirrus streaks.
@@ -564,7 +745,29 @@ function bakeMoon() {
   x.drawImage(m, cx - mc, cy - mc);
   x.restore();
   x.drawImage(m, cx - mc, cy - mc);
-  return { c, halo, r, size };
+  return { c, halo, r, size, disc: m };
+}
+
+// The far lighthouse beam: a warm cone, feathered across its width, fading along its length.
+// Drawn additively after the lighting pass. Length runs along x (lamp at x = 0).
+function bakeBeam() {
+  const w = 256, h = 64, c = makeCanvas(w, h), g = c.getContext('2d');
+  const img = g.createImageData(w, h), d = img.data;
+  for (let y = 0; y < h; y++) {
+    const yy = (y + 0.5) / h * 2 - 1;
+    for (let x = 0; x < w; x++) {
+      const t = (x + 0.5) / w;
+      const half = 0.07 + 0.93 * t;                       // the cone widens away from the lamp
+      const q = yy / half;
+      const along = Math.pow(1 - t, 1.3) * (0.45 + 0.55 * Math.exp(-t * 5));
+      const a = along * Math.exp(-q * q * 2.6);
+      const i = (y * w + x) * 4;
+      d[i] = 255; d[i + 1] = 214 + 30 * (1 - t); d[i + 2] = 150 + 50 * (1 - t);
+      d[i + 3] = 255 * clamp(a, 0, 1);
+    }
+  }
+  g.putImageData(img, 0, 0);
+  return c;
 }
 
 function bakeGlint() {
@@ -780,13 +983,38 @@ function fillMask(t, mask, col, w, h) {
   t.fillRect(0, 0, w, h);
   t.globalCompositeOperation = 'source-over';
 }
-function tintCloud(spr, p) {
-  const w = spr.w, h = spr.h;
-  fillMask(spr.tctx, spr.body, p.sh, w, h);
-  overlay(spr.tctx, spr.lit, p.lit, 1, w, h);
-  overlay(spr.tctx, spr.hi, p.hi, 1, w, h);
-  overlay(spr.tctx, spr.rim, p.rim, p.rs, w, h);
-  if (spr.rctx) fillMask(spr.rctx, spr.rim, p.glow, w, h);
+// CPU tint of a cloud: shadow -> lit -> highlight -> silhouette rim, with the masks of the
+// high light blended toward a side light by k (a low sun). Canvas 0 is for clouds with the
+// sun on their left, canvas 1 for the sun on their right.
+function tintCloudSide(spr, p, v, k) {
+  const d = spr.img.data, N = spr.w * spr.h, B = spr.body;
+  const L0 = spr.lit[0], H0 = spr.hi[0], R0 = spr.rim[0], L1 = spr.lit[v], H1 = spr.hi[v], R1 = spr.rim[v];
+  const ka = (1 - k) / 255, kb = k / 255, rs = p.rs;
+  const sh = p.sh, li = p.lit, hi = p.hi, rm = p.rim;
+  for (let i = 0, j = 0; i < N; i++, j += 4) {
+    const a = B[i];
+    if (a === 0) { d[j + 3] = 0; continue; }
+    const l = L0[i] * ka + L1[i] * kb, hh = H0[i] * ka + H1[i] * kb, q = (R0[i] * ka + R1[i] * kb) * rs;
+    let r = sh[0] + (li[0] - sh[0]) * l, g = sh[1] + (li[1] - sh[1]) * l, b = sh[2] + (li[2] - sh[2]) * l;
+    r += (hi[0] - r) * hh; g += (hi[1] - g) * hh; b += (hi[2] - b) * hh;
+    r += (rm[0] - r) * q; g += (rm[1] - g) * q; b += (rm[2] - b) * q;
+    d[j] = r; d[j + 1] = g; d[j + 2] = b; d[j + 3] = a;
+  }
+  spr.tctx[v - 1].putImageData(spr.img, 0, 0);
+  if (spr.rctx) {
+    const gc = p.glow;
+    for (let i = 0, j = 0; i < N; i++, j += 4) {
+      d[j] = gc[0]; d[j + 1] = gc[1]; d[j + 2] = gc[2];
+      d[j + 3] = R0[i] * (1 - k) + R1[i] * k;
+    }
+    spr.rctx[v - 1].putImageData(spr.img, 0, 0);
+  }
+}
+function tintCloud(spr, p, k) {
+  const two = k > 0.01;
+  tintCloudSide(spr, p, 1, two ? k : 0);
+  if (two) tintCloudSide(spr, p, 2, k);
+  spr.sideK = two ? k : 0;
 }
 function tintStrip(s, body, lit, litA, haze, hazeA) {
   const t = s.tctx, w = s.w, h = s.h;
@@ -803,12 +1031,15 @@ function tintStrip(s, body, lit, litA, haze, hazeA) {
 }
 const sigCloud = (p) => [p.sh[0], p.sh[1], p.sh[2], p.lit[0], p.lit[1], p.lit[2], p.hi[0], p.hi[1], p.hi[2], p.rim[0], p.rim[2], p.glow[0], p.glow[1], p.glow[2], p.rs * 255];
 
+function registerCloud(spr, id) {
+  tintables.push({
+    cost: spr.w * spr.h * 1.5, last: null,
+    sig: (pal) => { const a = sigCloud(pal.cl[id]); a.push(pal.side * 255); return a; },
+    apply: (pal) => tintCloud(spr, pal.cl[id], pal.side),
+  });
+}
 function registerTintables() {
-  for (const L of LAYERS) {
-    for (const spr of SPR[L.set]) {
-      tintables.push({ cost: spr.w * spr.h, last: null, sig: (pal) => sigCloud(pal.cl[L.id]), apply: (pal) => tintCloud(spr, pal.cl[L.id]) });
-    }
-  }
+  for (const L of LAYERS) for (const spr of SPR[L.set]) if (spr) registerCloud(spr, L.id);
   for (const spr of SPR.cirrus) {
     tintables.push({ cost: spr.w * spr.h * 0.3, last: null, sig: (pal) => pal.cirrus.slice(), apply: (pal) => fillMask(spr.tctx, spr.body, pal.cirrus, spr.w, spr.h) });
   }
@@ -863,16 +1094,18 @@ function buildOnce() {
   SPR.built = true;
   SPR.scratch = makeCanvas(MTN_W, 360);
   SPR.sctx = SPR.scratch.getContext('2d');
-  SPR.mid.push(
-    bakeCloud('tower', 101, 640, 440, true), bakeCloud('tower', 202, 560, 410, true),
-    bakeCloud('heap', 303, 620, 300, true), bakeCloud('heap', 404, 520, 270, true), bakeCloud('heap', 505, 700, 280, true),
-  );
-  SPR.far.push(bakeCloud('far', 606, 360, 130, false), bakeCloud('far', 707, 300, 110, false), bakeCloud('far', 808, 420, 125, false), bakeCloud('far', 909, 260, 100, false));
-  SPR.high.push(bakeCloud('deck', 1111, 780, 210, true), bakeCloud('deck', 1212, 680, 190, true), bakeCloud('deck', 1313, 860, 230, true));
+  // A few clouds are baked right away so the first frame has a sky; the rest are baked a
+  // slice per frame (pumpBake) and drift in as they become ready.
+  for (const j of CLOUD_JOBS) SPR[j[0]][j[1]] = null;
+  for (const j of CLOUD_JOBS) {
+    if (j[2]) SPR[j[0]][j[1]] = bakeCloud(...j.slice(3));
+    else BAKE.queue.push(j);
+  }
   SPR.cirrus.push(bakeCirrus(1414, 900, 150), bakeCirrus(1515, 760, 130));
   SPR.fog.push(bakeFog(1616, 1200, 150), bakeFog(1717, 1000, 120));
   SPR.shafts = bakeShafts();
   SPR.moon = bakeMoon();
+  SPR.beam = bakeBeam();
   SPR.glint = bakeGlint();
   SPR.rays = bakeRays();
   const m = bakeMountains();
@@ -880,6 +1113,25 @@ function buildOnce() {
   SPR.mtnFront = m.front;
   registerTintables();
   return true;
+}
+
+const SET_LAYER = { far: 0, mid: 1, high: 2 };
+// Spread the remaining cloud bakes over frames (~budget ms each).
+function pumpBake(budget) {
+  if (!BAKE.queue.length) return;
+  const t0 = performance.now();
+  while (BAKE.queue.length) {
+    const j = BAKE.queue[0];
+    if (!BAKE.gen) BAKE.gen = bakeCloudGen(...j.slice(3));
+    let r;
+    do { r = BAKE.gen.next(); } while (!r.done && performance.now() - t0 < budget);
+    if (!r.done) return;
+    BAKE.queue.shift();
+    BAKE.gen = null;
+    SPR[j[0]][j[1]] = r.value;
+    registerCloud(r.value, SET_LAYER[j[0]]);
+    if (performance.now() - t0 >= budget) return;
+  }
 }
 
 // ============================================================================
@@ -938,6 +1190,9 @@ function computePalette(G, st) {
     rim: mid.rim, glow: mid.glow, rs: mid.rs,
   };
   const cirrus = mixColor(mixColor(mid.hi, mid.glow, 0.35), sk[1], 0.15 + 0.3 * night);
+  // a low sun lights the clouds from the side (sun-facing flanks glow, the far side goes lilac)
+  const se = sunElev(p);
+  const side = (1 - smoothstep(0.1, 0.5, se)) * smoothstep(-0.3, -0.04, se) * (1 - gloom);
 
   const mtnBody = grade(mt[0], gloom * 0.6, lerp(1, 0.7, gloom));
   const mtnLit = grade(mt[1], gloom * 0.6, lerp(1, 0.7, gloom));
@@ -948,7 +1203,7 @@ function computePalette(G, st) {
   };
 
   return {
-    sky: sk, cl: [far, mid, high], cirrus, mtn, gloom, night, light,
+    sky: sk, cl: [far, mid, high], cirrus, mtn, gloom, night, light, side: side < 0.02 ? 0 : side,
     fogC, shaftC: mixColor(mid.sh, fogC, 0.4),
     wispC: mixColor(mixColor(fogC, [255, 255, 255], 0.2), [118, 136, 172], night * 0.6),
     starA: smoothstep(0.42, 0.12, light) * (1 - smoothstep(30, 78, luma(sk[0]))) * (1 - gloom) * (1 - 0.8 * fog) * (1 - 0.4 * clamp((cover - 0.55) * 2.2, 0, 1)),
@@ -961,11 +1216,17 @@ function computePalette(G, st) {
 // ============================================================================
 // Sun / moon geometry (screen space)
 // ============================================================================
+// Sun elevation over the day: 0 on the horizon, 1 at noon, negative below the horizon.
+function sunElev(phase) {
+  let p = phase || 0;
+  if (p > 0.8) p -= 1;
+  return Math.sin(Math.PI * clamp(p / C.SUNSET, -0.45, 1.45));
+}
 function sunPos(G, v, u) {
   let p = G.phase || 0;
   if (p > 0.8) p -= 1;
   const t = p / C.SUNSET;
-  const e = Math.sin(Math.PI * clamp(t, -0.45, 1.45));
+  const e = sunElev(G.phase);
   return {
     x: v.cssW * lerp(0.14, 0.8, t),
     y: v.seaScreenY - e * SUN_ARC * u,
@@ -1480,10 +1741,11 @@ function drawCloudLayer(ctx, G, v, L, pal, st, u, sea, W, H, glow) {
   const lightning = G.weather.lightning || 0;
   for (let k = k0; k <= k1; k++) {
     const h0 = hash1(k, L.seed);
-    const target = cov > h0 || (L.id > 0 && S > h0 * 0.5 + 0.12) ? 1 : 0;
-    const pres = cellPresence(L.id + k * 4, target);
-    if (pres <= 0.01) continue;
     const spr = set[(hash1(k, L.seed + 1) * set.length) | 0];
+    // a sprite that is still baking stays away and drifts in once it is ready
+    const target = spr && (cov > h0 || (L.id > 0 && S > h0 * 0.5 + 0.12)) ? 1 : 0;
+    const pres = cellPresence(L.id + k * 4, target);
+    if (pres <= 0.01 || !spr) continue;
     const sz = lerp(L.s0, L.s1, hash1(k, L.seed + 3)) * (L.id === 2 ? 1 + 0.35 * S : 1) * (0.5 + 0.5 * pres);
     const sc = (sz * u) / RS;
     const dw = spr.w * sc, dh = spr.h * sc;
@@ -1493,10 +1755,21 @@ function drawCloudLayer(ctx, G, v, L, pal, st, u, sea, W, H, glow) {
     const y = baseY - spr.baseFrac * dh;
     if (y > H || y + dh < 0) continue;
     const pa = smoothstep(0, 0.45, pres);
-    ctx.globalAlpha = pa * glow.alpha;
-    ctx.drawImage(spr.tinted, x, y, dw, dh);
+    const a = pa * glow.alpha;
+    // a low sun lights each cloud from the side the sun is on
+    const cx = x + dw * 0.5, cy = y + dh * 0.45;
+    const two = spr.sideK > 0.01;
+    const wR = two ? smoothstep(-1, 1, (glow.sx - cx) / (dw * 0.5 + 160 * u)) : 0;
+    const main = wR > 0.5 ? 1 : 0;
+    ctx.globalAlpha = a;
+    if (!two || wR < 0.02 || wR > 0.98) ctx.drawImage(spr.tinted[main], x, y, dw, dh);
+    else {
+      ctx.drawImage(spr.tinted[0], x, y, dw, dh);
+      ctx.globalAlpha = a * wR;
+      ctx.drawImage(spr.tinted[1], x, y, dw, dh);
+    }
+    occlude(spr.tinted[0], x, y, dw, dh, a, spr);
     if (spr.rimC) {
-      const cx = x + dw * 0.5, cy = y + dh * 0.45;
       let gl = lightning * 0.9;
       if (glow.sunA > 0.01) {
         const dx = (cx - glow.sx) / (dw * 0.5 + 260 * u), dy = (cy - glow.sy) / (dh * 0.5 + 200 * u);
@@ -1510,13 +1783,71 @@ function drawCloudLayer(ctx, G, v, L, pal, st, u, sea, W, H, glow) {
         // rims live on the upper part of the cloud; skip the belly to save fill
         const hf = 0.72;
         ctx.globalCompositeOperation = 'lighter';
-        ctx.globalAlpha = clamp(gl, 0, 1) * pa * glow.alpha;
-        ctx.drawImage(spr.rimC, 0, 0, spr.w, spr.h * hf, x, y, dw, dh * hf);
+        ctx.globalAlpha = clamp(gl, 0, 1) * a;
+        ctx.drawImage(spr.rimC[two ? main : 0], 0, 0, spr.w, spr.h * hf, x, y, dw, dh * hf);
         ctx.globalCompositeOperation = 'source-over';
       }
     }
   }
   ctx.globalAlpha = 1;
+}
+
+// ----------------------------------------------------------------------------
+// What drawSky leaves for drawWeather and post in the same frame: how much cloud
+// covers the sun and the moon, the moon's re-light mask with everything in front of
+// it cut away, and the far lighthouse lamp.
+const STAMP = {
+  sunOn: false, sx: 0, sy: 0, sr: 0, sunOcc: 0,
+  moonOn: false, mx: 0, my: 0, mr: 0, moonA: 0, moonOcc: 0,
+  layer: null, lctx: null, lx: 0, ly: 0, lw: 0, lk: 1,
+  lh: null,
+};
+function coverAt(spr, x, y, dw, dh, px, py, r) {
+  const fx = (px - x) / dw, fy = (py - y) / dh, ox = (r * 0.7) / dw, oy = (r * 0.7) / dh;
+  return (cloudBodyAt(spr, fx, fy) * 2 + cloudBodyAt(spr, fx - ox, fy) + cloudBodyAt(spr, fx + ox, fy)
+    + cloudBodyAt(spr, fx, fy - oy) + cloudBodyAt(spr, fx, fy + oy)) / 6;
+}
+// Something was drawn in front of the sun / moon: track the cover, cut it out of the moon mask.
+function occlude(img, x, y, dw, dh, a, spr) {
+  if (a < 0.01) return;
+  const S = STAMP;
+  if (S.lctx && x < S.lx + S.lw && x + dw > S.lx && y < S.ly + S.lw && y + dh > S.ly) {
+    S.lctx.globalAlpha = a > 1 ? 1 : a;
+    S.lctx.drawImage(img, (x - S.lx) * S.lk, (y - S.ly) * S.lk, dw * S.lk, dh * S.lk);
+  }
+  if (!spr) return;
+  if (S.sunOn && S.sx > x && S.sx < x + dw && S.sy > y && S.sy < y + dh) {
+    S.sunOcc = 1 - (1 - S.sunOcc) * (1 - clamp(a, 0, 1) * coverAt(spr, x, y, dw, dh, S.sx, S.sy, S.sr));
+  }
+  if (S.moonOn && S.mx > x && S.mx < x + dw && S.my > y && S.my < y + dh) {
+    S.moonOcc = 1 - (1 - S.moonOcc) * (1 - clamp(a, 0, 1) * coverAt(spr, x, y, dw, dh, S.mx, S.my, S.mr));
+  }
+}
+// The moon's re-light mask: the crescent, tinted with the gain that brings it back to warm
+// cream after the night grade (applied with colour-dodge in drawWeather).
+const MOON_GAIN = [104, 80, 18];
+function prepareMoonMask(v, moon, a) {
+  const S = STAMP;
+  S.moonOn = true; S.mx = moon.x; S.my = moon.y; S.mr = moon.r; S.moonA = a;
+  const m = SPR.moon;
+  if (!m || !m.disc) return;
+  const k = clamp(v.dpr || 1, 1, 2);
+  const size = moon.r * 3.2;
+  const px = Math.ceil(size * k);
+  if (!S.layer) { S.layer = makeCanvas(px, px); S.lctx = S.layer.getContext('2d'); }
+  if (S.layer.width !== px) { S.layer.width = px; S.layer.height = px; }
+  const c = S.lctx;
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.globalCompositeOperation = 'source-over';
+  c.globalAlpha = 1;
+  c.clearRect(0, 0, px, px);
+  const ds = (m.disc.width * (moon.r / m.r)) * k;
+  c.drawImage(m.disc, (px - ds) / 2, (px - ds) / 2, ds, ds);
+  c.globalCompositeOperation = 'source-in';
+  c.fillStyle = rgbS(MOON_GAIN);
+  c.fillRect(0, 0, px, px);
+  c.globalCompositeOperation = 'destination-out';
+  S.lx = moon.x - size / 2; S.ly = moon.y - size / 2; S.lw = size; S.lk = k;
 }
 
 function drawShafts(ctx, G, v, st, pal, u, sea, W) {
