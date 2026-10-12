@@ -195,7 +195,8 @@ function frame(now) {
   m.wx = w.x; m.wy = w.y;
   run('hud.frame', () => hud.frame(G, dt));
   if (G.mode === 'play') step(dt, false);
-  else if (G.mode === 'title') step(dt, true);
+  // the title backdrop and the ending keep the world alive (clouds, lighthouse lights) without the boy
+  else if (G.mode === 'title' || G.mode === 'ending') step(dt, true);
   run('audio.update', () => audio.update(G, dt));
   updateCamera(dt);
   syncView();

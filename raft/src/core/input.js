@@ -21,6 +21,7 @@ export const input = {
 
 const held = { left: new Set(), right: new Set(), up: new Set(), down: new Set(), use: new Set() };
 const swallowed = new Set();   // key codes ignored until released (see swallowInput)
+const down = new Set();        // key codes physically down right now
 function setHeld(name, src, on) {
   const s = held[name];
   if (on) s.add(src); else s.delete(src);
@@ -39,6 +40,16 @@ const KEYMAP = {
 };
 
 export function initInput(canvas) {
+  // a phone counts as touch from the start, so hints name the on-screen buttons before the first tap
+  try { if (window.matchMedia('(pointer: coarse)').matches) input.touch = true; } catch (e) { /* ignore */ }
+  // any tap or click anywhere (menus included) tells us which wording to use
+  window.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'touch') input.touch = true;
+    else if (e.pointerType === 'mouse') input.touch = false;
+  }, true);
+  // capture phase, so `down` is current before any menu handler calls swallowInput()
+  window.addEventListener('keydown', (e) => down.add(e.code), true);
+  window.addEventListener('keyup', (e) => down.delete(e.code), true);
   window.addEventListener('keydown', (e) => {
     if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
     input.touch = false;
@@ -65,6 +76,7 @@ export function initInput(canvas) {
     if (k) setHeld(k, 'key:' + e.code, false);
   });
   window.addEventListener('blur', () => {
+    down.clear(); swallowed.clear();
     for (const name of Object.keys(held)) { held[name].clear(); input[name] = false; }
   });
 
@@ -136,7 +148,7 @@ export function swallowInput() {
     for (const src of held[name]) if (src.startsWith('key:')) swallowed.add(src.slice(4));
     held[name].clear(); input[name] = false;
   }
-  swallowed.add('Space'); swallowed.add('Enter'); swallowed.add('NumpadEnter');
+  for (const code of down) swallowed.add(code);
   endInputFrame();
 }
 

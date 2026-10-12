@@ -3,8 +3,9 @@
 // drawLighting: a reduced-resolution darkness buffer (night, storm, and above all DEPTH),
 //   light pools carved out of it from G.lights, a faint halo that always keeps the boy
 //   findable, then an additive coloured glow pass for the lights themselves.
-// drawPost: colour grade per time of day, heavy vignette, animated film grain, dust motes,
-//   and finally G.fade (full-screen black for cutscenes).
+// drawPost: colour grade per time of day, heavy vignette (opened around the sun and moon),
+//   a small sun bloom so the sun is always the brightest thing, animated film grain, dust
+//   motes, and finally G.fade (full-screen black for cutscenes).
 
 import { clamp, smoothstep, hash1, mixColor, makeCanvas } from '../core/util.js';
 import { celestial } from './sky.js';
@@ -160,7 +161,7 @@ function weatherStorm(G) {
   return k === 'storm' ? 1 : k === 'rain' ? 0.45 : k === 'cloudy' ? 0.15 : 0;
 }
 
-function factors(G) {
+function factors(G, cel) {
   const light = G.light == null ? 1 : G.light;
   const W = G.weather || {};
   const nf = clamp((1 - light) / 0.92, 0, 1);
@@ -171,11 +172,24 @@ function factors(G) {
   // so sunrise and dusk stay warm instead of turning grey-purple.
   const sky = clamp(Math.pow(nf, 1.6) * 0.38 + storm * 0.26 * (1 - nf * 0.5) + fog * 0.06, 0, 0.7);
   const seaNight = clamp(nf * 0.76 + storm * 0.34 + fog * 0.05, 0, 0.92);
-  return { nf, storm, fog, flash, sky, seaNight, keep: 1 - 0.85 * flash, light };
+  // Deep night (not dawn or dusk, whose painted skies are already bright and warm while
+  // G.light is still low): judged from the painted zenith when the sky reports it.
+  let skyNight = smoothstep(0.85, 1, nf);
+  const z = cel && cel.zenith;
+  if (Array.isArray(z) && isFinite(z[0])) skyNight = 1 - smoothstep(20, 50, z[0] * 0.3 + z[1] * 0.59 + z[2] * 0.11);
+  const deepN = smoothstep(0.8, 1, nf) * skyNight;
+  return { nf, storm, fog, flash, sky, seaNight, deepN, keep: 1 - 0.85 * flash, light };
 }
 
+// Air darkness at world height wy. At deep night the air around the boy closes in (~0.7 from
+// the horizon up to about y = -230) while the high sky stays open (<= 0.25) so moonlit
+// clouds keep their colour; the raft's lights then make a warm island in the dark.
+const NIGHT_LOW = 0.7, NIGHT_HIGH = 0.24;
 function skyA(F, wy) {
-  return F.sky * (0.5 + 0.5 * smoothstep(-430, -50, wy)) * F.keep;
+  const base = F.sky * (0.5 + 0.5 * smoothstep(-430, -50, wy));
+  if (F.deepN <= 0.001) return base * F.keep;
+  const band = F.deepN * (NIGHT_HIGH + (NIGHT_LOW - NIGHT_HIGH) * smoothstep(-325, -228, wy));
+  return Math.max(base, band) * F.keep;
 }
 function seaA(F, wy) {
   const dd = depthDark(wy) * (1 + F.storm * 0.12);
@@ -199,7 +213,9 @@ export function drawLighting(ctx, G) {
   if (!(v.cssW > 2) || !ensureArt()) return;
   if (!buf || Math.abs(buf.width - Math.ceil(v.cssW * (v.cssW * v.cssH > 1.6e6 ? BUF_SCALE * 0.75 : BUF_SCALE))) > 1) resize(G);
   if (!buf) return;
-  const F = factors(G);
+  let cel = null;
+  try { cel = celestial(G); } catch (e) { cel = null; }
+  const F = factors(G, cel);
   const W = v.cssW, H = v.cssH, sc = v.scale, cx = W / 2, cy = H / 2;
   const camX = G.cam.x + (G.cam.shakeX || 0), camY = G.cam.y + (G.cam.shakeY || 0);
   const wyOf = (sy) => camY + (sy - cy) / sc;
@@ -271,13 +287,17 @@ export function drawLighting(ctx, G) {
     drawn.push(l);
   }
   // the moon keeps its glow; the setting sun too
-  let cel = null;
-  try { cel = celestial(G); } catch (e) { cel = null; }
   if (cel) {
     if (cel.moonVisible && isFinite(cel.moonX) && isFinite(cel.moonY) && F.sky > 0.05) {
       const r = Math.min(W, H) * 0.16;
       b.globalAlpha = 0.85;
       b.drawImage(ART.hole, cel.moonX - r, cel.moonY - r, r * 2, r * 2);
+      // a wider, faint moonlit zone: the clouds near the moon keep their colour
+      if (F.deepN > 0.05) {
+        const r2 = Math.min(W, H) * 0.32;
+        b.globalAlpha = 0.4 * F.deepN * clamp(cel.moonAlpha == null ? 1 : cel.moonAlpha, 0, 1);
+        b.drawImage(ART.hole, cel.moonX - r2, cel.moonY - r2, r2 * 2, r2 * 2);
+      }
       // the moon's path on the far sea stays silver
       if (sy0 > -20 && sy0 < H + 20) {
         const rw = 150, rh = 16;
@@ -380,7 +400,9 @@ export function drawPost(ctx, G) {
   watchFrameRate();
   const low = FX.low;
   const W = v.cssW, H = v.cssH;
-  const F = factors(G);
+  let cel = null;
+  try { cel = celestial(G); } catch (e) { cel = null; }
+  const F = factors(G, cel);
   const ph = ((G.phase % 1) + 1) % 1;
   const camY = G.cam.y;
   const under = smoothstep(-20, 60, camY);            // camera underwater
@@ -433,21 +455,23 @@ export function drawPost(ctx, G) {
   // ---- dust motes in the light (above water) / drifting specks (under water by day)
   if (!low) drawMotes(ctx, G, W, H, F, day, dusk, under, deep, t);
 
-  // ---- vignette
+  // ---- vignette (opened up around the sun and the moon, which stay the brightest things)
   ctx.globalCompositeOperation = 'source-over';
   const P = G.player;
   const ox = P && isFinite(P.oxygen) ? P.oxygen : 100;
   const tunnel = G.mode === 'play' || G.mode === 'dead' ? smoothstep(35, 5, ox) : 0;
   const vig = 0.52 + 0.3 * F.nf + 0.25 * deep + 0.12 * F.storm + 0.08 * under + 0.3 * dead;
+  const holes = celestialHoles(cel, v, F, dead);
   ctx.globalAlpha = clamp(vig, 0, 1);
-  ctx.drawImage(ART.vignette, -2, -2, W + 4, H + 4);
+  ctx.drawImage(holedVignette(0, holes, -2, -2, W + 4, H + 4), -2, -2, W + 4, H + 4);
   if (vig > 1 || tunnel > 0.01 || (F.nf > 0.5 && !low)) {
     // a second, tighter pass for the Little-Nightmares crush at night / when out of air
     const k = clamp(Math.max(vig - 1, 0) + (F.nf - 0.5) * 0.6 + tunnel * (0.8 + 0.2 * Math.sin(t * 5)), 0, 1);
     if (k > 0.01) {
       const s = 1 - 0.12 * k - 0.1 * tunnel;
+      const vx = W * (1 - s) / 2, vy = H * (1 - s) / 2;
       ctx.globalAlpha = k;
-      ctx.drawImage(ART.vignette, W * (1 - s) / 2, H * (1 - s) / 2, W * s, H * s);
+      ctx.drawImage(holedVignette(1, holes, vx, vy, W * s, H * s), vx, vy, W * s, H * s);
       ctx.fillStyle = '#020308';
       // keep the frame closed outside the shrunken vignette
       const ix = W * (1 - s) / 2, iy = H * (1 - s) / 2;
@@ -455,6 +479,9 @@ export function drawPost(ctx, G) {
       ctx.fillRect(0, iy, ix, H - 2 * iy); ctx.fillRect(W - ix, iy, ix, H - 2 * iy);
     }
   }
+
+  // ---- the sun stays the brightest thing on screen: a small additive bloom over the grade
+  if (cel && !dead) drawSunBloom(ctx, G, cel, F, W, H);
 
   // ---- film grain
   const gp = G.postFx || (G.postFx = { grain: 0, gx: 0, gy: 0 });
@@ -488,6 +515,89 @@ export function drawPost(ctx, G) {
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, W, H);
   }
+  ctx.restore();
+}
+
+// Where the vignette must not darken the sky's own lights.
+function celestialHoles(cel, v, F, dead) {
+  const holes = [];
+  if (!cel || dead) return holes;
+  const sea = v.seaScreenY;
+  if (cel.sunVisible && isFinite(cel.sunX) && isFinite(cel.sunY) && cel.sunY < sea + 4) {
+    const a = clamp((cel.sunAlpha == null ? 1 : cel.sunAlpha) * (1 - 0.7 * (cel.sunCover || 0)), 0, 1);
+    if (a > 0.02) holes.push({ x: cel.sunX, y: cel.sunY, r: Math.max(40, (cel.sunR || 16) * 7), a: a * 0.9 });
+  }
+  if (cel.moonVisible && isFinite(cel.moonX) && isFinite(cel.moonY) && cel.moonY < sea + 4 && F.nf > 0.3) {
+    const a = clamp((cel.moonAlpha == null ? 1 : cel.moonAlpha) * (1 - 0.6 * (cel.moonCover || 0)) * smoothstep(0.3, 0.7, F.nf), 0, 1);
+    if (a > 0.02) holes.push({ x: cel.moonX, y: cel.moonY, r: Math.max(40, (cel.moonR || 29) * 4.2), a: a * 0.85 });
+  }
+  return holes;
+}
+
+// The vignette sprite with soft holes punched at the given screen points. `rx..rh` is the
+// screen rect the sprite will be stretched over. Two slots for the two vignette passes.
+const VH = [null, null];
+function holedVignette(slot, holes, rx, ry, rw, rh) {
+  if (!holes.length) return ART.vignette;
+  const S = ART.vignette.width;
+  let e = VH[slot];
+  if (!e) { const c = makeCanvas(S, S); e = VH[slot] = { c, g: c.getContext('2d') }; }
+  const g = e.g;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 1;
+  g.globalCompositeOperation = 'copy';
+  g.drawImage(ART.vignette, 0, 0);
+  g.globalCompositeOperation = 'destination-out';
+  for (const h of holes) {
+    g.setTransform(h.r * S / rw, 0, 0, h.r * S / rh, (h.x - rx) * S / rw, (h.y - ry) * S / rh);
+    const gr = g.createRadialGradient(0, 0, 0, 0, 0, 1);
+    gr.addColorStop(0, `rgba(0,0,0,${h.a.toFixed(3)})`);
+    gr.addColorStop(0.4, `rgba(0,0,0,${(h.a * 0.7).toFixed(3)})`);
+    gr.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = gr;
+    g.fillRect(-1, -1, 2, 2);
+  }
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalCompositeOperation = 'source-over';
+  return e.c;
+}
+
+// Additive bloom on the sun after the grade and the vignette: a hot core that clips toward
+// white (warm when the sun is low) and a soft glow. Hidden by cloud cover, and never below
+// the horizon or seen through the water.
+function drawSunBloom(ctx, G, cel, F, W, H) {
+  if (!cel.sunVisible || !isFinite(cel.sunX) || !isFinite(cel.sunY)) return;
+  const sea = G.view.seaScreenY;
+  if (!(sea > 0)) return;
+  const k = clamp((cel.sunAlpha == null ? 1 : cel.sunAlpha) * (1 - (cel.sunCover || 0)) * (1 - 0.7 * F.storm), 0, 1);
+  if (k < 0.02) return;
+  const x = cel.sunX, y = cel.sunY, r = cel.sunR || 16;
+  if (x < -r * 8 || x > W + r * 8 || y < -r * 8) return;
+  const sc = Array.isArray(cel.sunColor) ? cel.sunColor : [255, 240, 220];
+  const hiE = smoothstep(0.05, 0.4, cel.sunE == null ? 0.5 : cel.sunE);   // 1 = high (white) sun
+  const core = mixColor(sc, [255, 255, 255], 0.15 + 0.7 * hiE);
+  const coreA = 0.3 + 0.55 * hiE;                       // a low sun stays golden, not white
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, W, Math.min(H, sea));
+  ctx.clip();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 1;
+  const R = r * 7;
+  let g = ctx.createRadialGradient(x, y, r * 0.6, x, y, R);
+  g.addColorStop(0, rgba(sc, 0.3 * k));
+  g.addColorStop(0.2, rgba(sc, 0.1 * k));
+  g.addColorStop(1, rgba(sc, 0));
+  ctx.fillStyle = g;
+  ctx.fillRect(x - R, y - R, R * 2, R * 2);
+  const rc = r * 1.2;
+  g = ctx.createRadialGradient(x, y, 0, x, y, rc);
+  g.addColorStop(0, rgba(core, coreA * k));
+  g.addColorStop(0.55, rgba(core, coreA * 0.82 * k));
+  g.addColorStop(0.8, rgba(core, coreA * 0.35 * k));
+  g.addColorStop(1, rgba(core, 0));
+  ctx.fillStyle = g;
+  ctx.fillRect(x - rc, y - rc, rc * 2, rc * 2);
   ctx.restore();
 }
 

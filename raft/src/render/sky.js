@@ -9,10 +9,15 @@
 //   - painterly towering cumulus baked once into sprites (lit tops, shadowed
 //     bellies, rim light) and re-tinted for the time of day in the background,
 //     composited in parallax layers; thin cirrus; distant rain shafts
-//   - distant mountains / sea stacks on the horizon, and the lighthouse beam
-//     that appears late in the journey
+//   - distant mountains / sea stacks on the horizon, and the lighthouse that
+//     appears late in the journey
 //   - weather state machine that owns G.weather; rain, mist, fog banks and
 //     lightning drawn in screen space after the lighting pass
+//   - the sky's own lights are re-lit after the lighting pass (drawWeather) so the
+//     night grade cannot grey them: the moon (colour-dodge mask with the clouds in
+//     front cut out, warm cream halo) and the far lighthouse's beam and lamp.
+//     celestial() also reports how much cloud / land hides the sun and the moon,
+//     which post uses for the sun bloom and the vignette
 //
 // Exports: init, update, drawSky, drawWeather, debugWeather, celestial.
 // ============================================================================
@@ -21,11 +26,12 @@ import { C, say, journal } from '../core/state.js';
 import { TAU, clamp, lerp, smoothstep, hash1, noise1, seeded, mixColor, hexToRgb, makeCanvas, gradientAt } from '../core/util.js';
 import { getAsset } from '../core/assets.js';
 import { sfx } from '../systems/audio.js';
+import { groundAt as islandGroundAt } from '../systems/islands.js';
 
 // ------------------------------------------------------------------ constants
 const RS = 0.75;          // cloud sprites are baked at this many px per 720p screen px
 const SKY_REF = 560;      // height of the painted gradient above the horizon (u = cssH/720)
-const SUN_ARC = 400;      // how far above the horizon the sun climbs at noon (u)
+const SUN_ARC = 280;      // how far above the horizon the sun climbs at noon (u); low enough to stay clear of the toasts
 const MOON_ARC = 350;
 const MTN_W = 2400;       // far horizon strip (tiles horizontally), baked at u = 1
 const MTN_H = 130;
@@ -241,7 +247,7 @@ function tickPresence() {
 // Light set-ups for the cloud bake. 0: high light (day sun, night moon); 1: a low sun to
 // the LEFT of the cloud; 2: a low sun to the RIGHT. `l` points toward the light in 3D
 // (screen y down, z toward the viewer), `m` is the 2D direction the shadow march takes.
-const LIT_A = 0.2, LIT_B = 0.5, HI_A = 0.46, HI_B = 0.76;   // luminance ramps of the cloud masks
+const LIT_A = 0.18, LIT_B = 0.48, HI_A = 0.41, HI_B = 0.7;   // luminance ramps of the cloud masks
 const CLOUD_LIGHTS = [
   { l: [-0.27, -0.9, 0.34], m: [-0.27, -0.96] },
   { l: [-0.86, -0.36, 0.36], m: [-0.92, -0.39] },
@@ -420,6 +426,14 @@ function* bakeCloudGen(kind, seed, wU, hU, withRimC) {
     }
   }
   yield;
+  // close pinholes between lobes, which would let the sky show through the cloud
+  {
+    const cb = boxBlur(boxBlur(cov, w, h, 3), w, h, 2);
+    for (let i = 0; i < N; i++) {
+      const c = cb[i];
+      if (c > 0.55 && cov[i] < 1) { const f = smoothstep(0.55, 0.82, c); if (f > cov[i]) cov[i] = f; }
+    }
+  }
   // per-column top (for the belly / depth terms)
   const colTop = new Float32Array(w);
   let cloudTop = h;
@@ -431,7 +445,7 @@ function* bakeCloudGen(kind, seed, wU, hU, withRimC) {
   }
   const colTopS = boxBlur(colTop, w, 1, Math.max(2, Math.round(maxR * 0.35)));
   const covS = boxBlur(cov, w, h, 1);                       // soft outline, no stair steps when scaled
-  const covB = boxBlur(boxBlur(covS, w, h, 2), w, h, 2);    // the band just inside the silhouette
+  const covB = boxBlur(boxBlur(covS, w, h, 3), w, h, 3);    // the band just inside the silhouette
   // large-scale volume: a heavily blurred silhouette gives a "pillow" normal that holds the
   // lobes together into one mass
   const gb = Math.max(3, Math.round(maxR * 0.5));
@@ -523,7 +537,7 @@ function* bakeCloudGen(kind, seed, wU, hU, withRimC) {
       const shade = (1 - 0.16 * smoothstep(0.15, 0.9, depth)) * (1 - 0.32 * crease);
       const tone = (idb[i] >= 0 ? lobes[idb[i]].tone * 0.5 : 0) + lo(noiseLo[2], x, y) * 0.1;
       // silhouette band and which way it faces
-      const edge = smoothstep(0.08, 0.5, 1 - covB[i]);
+      const edge = smoothstep(0.05, 0.56, 1 - covB[i]);
       let ox = 0, oy = 0;
       if (edge > 0.002) {
         ox = covB[xl] - covB[xr]; oy = covB[yu + x] - covB[yd + x];
@@ -760,9 +774,12 @@ function bakeBeam() {
       const half = 0.07 + 0.93 * t;                       // the cone widens away from the lamp
       const q = yy / half;
       const along = Math.pow(1 - t, 1.3) * (0.45 + 0.55 * Math.exp(-t * 5));
-      const a = along * Math.exp(-q * q * 2.6);
+      const core = Math.exp(-q * q * 2.6);
+      const a = along * core;
+      // warm white along the axis near the lamp, amber toward the soft edges and the far end
+      const k = core * (1 - 0.6 * t);
       const i = (y * w + x) * 4;
-      d[i] = 255; d[i + 1] = 214 + 30 * (1 - t); d[i + 2] = 150 + 50 * (1 - t);
+      d[i] = 255; d[i + 1] = 160 + 70 * k; d[i + 2] = 78 + 104 * k * k;
       d[i + 3] = 255 * clamp(a, 0, 1);
     }
   }
@@ -882,8 +899,8 @@ function bakeMountains() {
     return Math.max(l, (1 - smoothstep(0, 2.4, depth)) * 0.6);
   });
   const fr = mk(front, (i, y, depth, slope) => (1 - smoothstep(0, 2, depth)) * 0.7 + smoothstep(0, 0.8, slope) * 0.25 * (1 - smoothstep(2, 14, depth)));
-  const strip = (m) => { const s = { w, h, body: m.body, lit: m.lit, tinted: makeCanvas(w, h) }; s.tctx = s.tinted.getContext('2d'); return s; };
-  return { back: strip(bk), front: strip(fr) };
+  const strip = (m, hts) => { const s = { w, h, hts, body: m.body, lit: m.lit, tinted: makeCanvas(w, h) }; s.tctx = s.tinted.getContext('2d'); return s; };
+  return { back: strip(bk, back), front: strip(fr, front) };
 }
 
 // Star field (depends on the screen size; rebuilt on resize).
@@ -1032,9 +1049,10 @@ function tintStrip(s, body, lit, litA, haze, hazeA) {
 const sigCloud = (p) => [p.sh[0], p.sh[1], p.sh[2], p.lit[0], p.lit[1], p.lit[2], p.hi[0], p.hi[1], p.hi[2], p.rim[0], p.rim[2], p.glow[0], p.glow[1], p.glow[2], p.rs * 255];
 
 function registerCloud(spr, id) {
+  // CPU tints: re-tinted only when a colour moved by ~2% (or the side light by ~3%)
   tintables.push({
-    cost: spr.w * spr.h * 1.5, last: null,
-    sig: (pal) => { const a = sigCloud(pal.cl[id]); a.push(pal.side * 255); return a; },
+    cost: spr.w * spr.h * 1.5, last: null, tol: 5,
+    sig: (pal) => { const a = sigCloud(pal.cl[id]); a.push(pal.side * 150); return a; },
     apply: (pal) => tintCloud(spr, pal.cl[id], pal.side),
   });
 }
@@ -1075,12 +1093,13 @@ function updateTints(pal) {
   lastSkySig = skySig;
   if (jump) presSnap = true;
   let budget = 140000;
+  const t0 = performance.now();
   for (let n = 0; n < tintables.length; n++) {
     const t = tintables[tintCursor];
     tintCursor = (tintCursor + 1) % tintables.length;
     const sig = t.sig(pal);
-    if (!t.last || jump || sigDiff(sig, t.last) > 2.5) {
-      if (t.last && !jump && budget <= 0) continue;
+    if (!t.last || jump || sigDiff(sig, t.last) > (t.tol || 2.5)) {
+      if (t.last && !jump && (budget <= 0 || performance.now() - t0 > 2.5)) continue;
       t.apply(pal);
       t.last = sig;
       budget -= t.cost;
@@ -1153,9 +1172,12 @@ function computePalette(G, st) {
   const cl = sampleKeys(CLOUD_KEYS, p);
   const mt = sampleKeys(MTN_KEYS, p);
 
-  // fog colour is derived from the low sky before grading
+  // fog colour is derived from the low sky before grading; by day it is a neutral pearl
+  // (warmer around a low sun), so a fog bank reads as fog and not as more sky
   const lowMix = mixColor(sk[3], sk[4], 0.5);
-  const fogC = mixColor(lowMix, [luma(lowMix), luma(lowMix), luma(lowMix) * 1.08], 0.45);
+  const se = sunElev(p);
+  const pearlK = (1 - night) * lerp(0.3, 0.78, smoothstep(0.08, 0.4, se));
+  const fogC = mixColor(mixColor(lowMix, [luma(lowMix), luma(lowMix), luma(lowMix) * 1.08], 0.45), [222, 225, 223], pearlK);
 
   const greyAmt = clamp((cover - 0.6) * 0.45, 0, 0.18) + gloom * 0.78;
   const skyK = lerp(1, 0.6, gloom);
@@ -1191,7 +1213,6 @@ function computePalette(G, st) {
   };
   const cirrus = mixColor(mixColor(mid.hi, mid.glow, 0.35), sk[1], 0.15 + 0.3 * night);
   // a low sun lights the clouds from the side (sun-facing flanks glow, the far side goes lilac)
-  const se = sunElev(p);
   const side = (1 - smoothstep(0.1, 0.5, se)) * smoothstep(-0.3, -0.04, se) * (1 - gloom);
 
   const mtnBody = grade(mt[0], gloom * 0.6, lerp(1, 0.7, gloom));
@@ -1453,10 +1474,13 @@ export function update(G, dt) {
     const la = lh.vis * smoothstep(0.25, 0.75, nightOf(G));
     if (la > 0.02 && v.seaScreenY > 0) {
       const sy = v.seaScreenY - 27.8 * lh.s;
-      G.lights.push({
-        x: G.cam.x + (lh.x - v.cssW / 2) / v.scale, y: G.cam.y + (sy - v.cssH / 2) / v.scale,
-        r: (21 + 13 * lh.s / u) * u / v.scale, color: [255, 222, 160], a: 0.85 * la,
-      });
+      const wx = G.cam.x + (lh.x - v.cssW / 2) / v.scale, wy = G.cam.y + (sy - v.cssH / 2) / v.scale;
+      let gy = null;
+      try { gy = islandGroundAt(G, wx); } catch (e) { gy = null; }
+      // an island in front hides the lamp
+      if (gy == null || gy >= wy + 4) {
+        G.lights.push({ x: wx, y: wy, r: (21 + 13 * lh.s / u) * u / v.scale, color: [255, 222, 160], a: 0.85 * la });
+      }
     }
   }
 
@@ -1493,6 +1517,10 @@ export function celestial(G) {
     moonX: m.x, moonY: m.y, moonVisible: moonA > 0.05 && m.y < v.seaScreenY + m.r, moonAlpha: moonA, moonR: m.r,
     sunColor: sunColorAt(s.e), moonColor: [236, 230, 205],
     horizon: sky[4], zenith: sky[0], storm: S, cloudCover: st ? st.cover : 0.4,
+    // elevation above the horizon (1 = highest), and how much cloud / far land hides each
+    // disc in the last drawn frame (0 clear .. 1 hidden)
+    sunE: s.e, moonE: m.e,
+    sunCover: STAMP.sunOn ? STAMP.sunOcc : 0, moonCover: STAMP.moonOn ? STAMP.moonOcc : 0,
   };
 }
 
@@ -1723,8 +1751,10 @@ function drawCirrus(ctx, G, v, st, u, sea, W, alpha) {
     const x = k * cell + hash1(k, CIRRUS.seed + 3) * cell * 0.5 - off;
     if (x > W || x + dw < 0) continue;
     const y = sea - lerp(310, 450, hash1(k, CIRRUS.seed + 4)) * u - dh / 2;
-    ctx.globalAlpha = alpha * lerp(0.55, 1, hash1(k, CIRRUS.seed + 5));
+    const a = alpha * lerp(0.55, 1, hash1(k, CIRRUS.seed + 5));
+    ctx.globalAlpha = a;
     ctx.drawImage(spr.tinted, x, y, dw, dh);
+    occlude(spr.tinted, x, y, dw, dh, a * 0.6, null);
   }
   ctx.globalAlpha = 1;
 }
@@ -1760,13 +1790,14 @@ function drawCloudLayer(ctx, G, v, L, pal, st, u, sea, W, H, glow) {
     const cx = x + dw * 0.5, cy = y + dh * 0.45;
     const two = spr.sideK > 0.01;
     const wR = two ? smoothstep(-1, 1, (glow.sx - cx) / (dw * 0.5 + 160 * u)) : 0;
-    const main = wR > 0.5 ? 1 : 0;
+    const main = wR > 0.5 ? 1 : 0, wMinor = main ? 1 - wR : wR;
+    // the dominant variant first, then the other at its weight: exact inside the cloud, and
+    // its soft edge doesn't pick up the other variant's rim
     ctx.globalAlpha = a;
-    if (!two || wR < 0.02 || wR > 0.98) ctx.drawImage(spr.tinted[main], x, y, dw, dh);
-    else {
-      ctx.drawImage(spr.tinted[0], x, y, dw, dh);
-      ctx.globalAlpha = a * wR;
-      ctx.drawImage(spr.tinted[1], x, y, dw, dh);
+    ctx.drawImage(spr.tinted[main], x, y, dw, dh);
+    if (two && wMinor > 0.02) {
+      ctx.globalAlpha = a * wMinor;
+      ctx.drawImage(spr.tinted[1 - main], x, y, dw, dh);
     }
     occlude(spr.tinted[0], x, y, dw, dh, a, spr);
     if (spr.rimC) {
@@ -1793,47 +1824,86 @@ function drawCloudLayer(ctx, G, v, L, pal, st, u, sea, W, H, glow) {
 }
 
 // ----------------------------------------------------------------------------
-// What drawSky leaves for drawWeather and post in the same frame: how much cloud
-// covers the sun and the moon, the moon's re-light mask with everything in front of
-// it cut away, and the far lighthouse lamp.
+// What drawSky leaves for drawWeather and post in the same frame: how much cloud (or
+// mountain) covers the sun and the moon, and the moon's re-light mask with everything
+// drawn in front of it cut away.
 const STAMP = {
   sunOn: false, sx: 0, sy: 0, sr: 0, sunOcc: 0,
-  moonOn: false, mx: 0, my: 0, mr: 0, moonA: 0, moonOcc: 0,
-  layer: null, lctx: null, lx: 0, ly: 0, lw: 0, lk: 1,
-  lh: null,
+  moonOn: false, mx: 0, my: 0, mr: 0, moonOcc: 0, restA: 0,
+  maskOn: false, layer: null, lctx: null, lx: 0, ly: 0, lw: 0, lk: 1,
 };
+function resetStamp() {
+  const S = STAMP;
+  S.sunOn = false; S.moonOn = false; S.maskOn = false;
+  S.sunOcc = 0; S.moonOcc = 0; S.restA = 0;
+}
 function coverAt(spr, x, y, dw, dh, px, py, r) {
   const fx = (px - x) / dw, fy = (py - y) / dh, ox = (r * 0.7) / dw, oy = (r * 0.7) / dh;
   return (cloudBodyAt(spr, fx, fy) * 2 + cloudBodyAt(spr, fx - ox, fy) + cloudBodyAt(spr, fx + ox, fy)
     + cloudBodyAt(spr, fx, fy - oy) + cloudBodyAt(spr, fx, fy + oy)) / 6;
 }
+const addCover = (o, c) => 1 - (1 - o) * (1 - clamp(c, 0, 1));
+// How much of a disc at screen (px, py), radius r, an island standing in front of it hides.
+// (The islands are drawn after the sky; their ground line is all we can ask for.)
+function islandCover(G, v, px, py, r) {
+  if (!G.cam || !(v.scale > 0)) return 0;
+  let c = 0;
+  for (const ox of [-0.7, 0, 0.7]) {
+    const wx = G.cam.x + (px + ox * r - v.cssW / 2) / v.scale;
+    let gy = null;
+    try { gy = islandGroundAt(G, wx); } catch (e) { gy = null; }
+    if (gy == null || !isFinite(gy)) continue;
+    const top = v.cssH / 2 + (gy - G.cam.y) * v.scale;      // ground line on screen
+    c += clamp((py + r - top) / (2 * r), 0, 1) / 3;
+  }
+  return c;
+}
 // Something was drawn in front of the sun / moon: track the cover, cut it out of the moon mask.
 function occlude(img, x, y, dw, dh, a, spr) {
   if (a < 0.01) return;
   const S = STAMP;
-  if (S.lctx && x < S.lx + S.lw && x + dw > S.lx && y < S.ly + S.lw && y + dh > S.ly) {
+  if (S.maskOn && x < S.lx + S.lw && x + dw > S.lx && y < S.ly + S.lw && y + dh > S.ly) {
     S.lctx.globalAlpha = a > 1 ? 1 : a;
     S.lctx.drawImage(img, (x - S.lx) * S.lk, (y - S.ly) * S.lk, dw * S.lk, dh * S.lk);
   }
   if (!spr) return;
   if (S.sunOn && S.sx > x && S.sx < x + dw && S.sy > y && S.sy < y + dh) {
-    S.sunOcc = 1 - (1 - S.sunOcc) * (1 - clamp(a, 0, 1) * coverAt(spr, x, y, dw, dh, S.sx, S.sy, S.sr));
+    S.sunOcc = addCover(S.sunOcc, a * coverAt(spr, x, y, dw, dh, S.sx, S.sy, S.sr));
   }
   if (S.moonOn && S.mx > x && S.mx < x + dw && S.my > y && S.my < y + dh) {
-    S.moonOcc = 1 - (1 - S.moonOcc) * (1 - clamp(a, 0, 1) * coverAt(spr, x, y, dw, dh, S.mx, S.my, S.mr));
+    S.moonOcc = addCover(S.moonOcc, a * coverAt(spr, x, y, dw, dh, S.mx, S.my, S.mr));
+  }
+}
+// A far horizon strip (mountains, sea stacks) in front of a low sun or moon.
+function occludeStrip(s, x0, sw, u, sea, yOff, a) {
+  const S = STAMP;
+  if (!s.hts || a < 0.01) return;
+  const ridge = (px) => {
+    const i = Math.floor(pmod(px - x0, sw) / u) % s.w;
+    return sea + yOff - s.hts[i] * u;
+  };
+  if (S.sunOn && S.sy + S.sr > sea - s.h * u) {
+    const c = clamp((S.sy + S.sr * 0.8 - ridge(S.sx)) / (S.sr * 1.6), 0, 1);
+    if (c > 0) S.sunOcc = addCover(S.sunOcc, c * a);
+  }
+  if (S.moonOn && S.my + S.mr > sea - s.h * u) {
+    const c = clamp((S.my + S.mr * 0.8 - ridge(S.mx)) / (S.mr * 1.6), 0, 1);
+    if (c > 0) S.moonOcc = addCover(S.moonOcc, c * a);
   }
 }
 // The moon's re-light mask: the crescent, tinted with the gain that brings it back to warm
-// cream after the night grade (applied with colour-dodge in drawWeather).
-const MOON_GAIN = [104, 80, 18];
-function prepareMoonMask(v, moon, a) {
+// cream after the night grade (applied with colour-dodge in drawWeather: it brightens the
+// moon that is already there, and does next to nothing to a dark shape that happens to be
+// in front of it).
+const MOON_GAIN = [124, 86, 32];
+function prepareMoonMask(v, moon, restA) {
   const S = STAMP;
-  S.moonOn = true; S.mx = moon.x; S.my = moon.y; S.mr = moon.r; S.moonA = a;
+  S.moonOn = true; S.mx = moon.x; S.my = moon.y; S.mr = moon.r; S.restA = restA;
   const m = SPR.moon;
-  if (!m || !m.disc) return;
+  if (!m || !m.disc || restA < 0.01) return;
   const k = clamp(v.dpr || 1, 1, 2);
   const size = moon.r * 3.2;
-  const px = Math.ceil(size * k);
+  const px = Math.max(8, Math.ceil(size * k));
   if (!S.layer) { S.layer = makeCanvas(px, px); S.lctx = S.layer.getContext('2d'); }
   if (S.layer.width !== px) { S.layer.width = px; S.layer.height = px; }
   const c = S.lctx;
@@ -1848,6 +1918,128 @@ function prepareMoonMask(v, moon, a) {
   c.fillRect(0, 0, px, px);
   c.globalCompositeOperation = 'destination-out';
   S.lx = moon.x - size / 2; S.ly = moon.y - size / 2; S.lw = size; S.lk = k;
+  S.maskOn = true;
+}
+
+// After the lighting pass: the moon comes back warm cream, with a soft cream halo.
+function drawMoonRestamp(ctx) {
+  const S = STAMP;
+  if (!S.moonOn || S.restA < 0.01) return;
+  const clear = 1 - S.moonOcc;
+  const ha = S.restA * (0.25 + 0.75 * clear);
+  ctx.save();
+  if (ha > 0.01) {
+    const R = S.mr * 6;
+    const g = ctx.createRadialGradient(S.mx, S.my, S.mr * 0.7, S.mx, S.my, R);
+    g.addColorStop(0, rgbaS([255, 232, 188], 0.24 * ha));
+    g.addColorStop(0.18, rgbaS([246, 222, 186], 0.09 * ha));
+    g.addColorStop(0.5, rgbaS([214, 206, 200], 0.025 * ha));
+    g.addColorStop(1, rgbaS([200, 200, 210], 0));
+    ctx.globalCompositeOperation = 'screen';
+    ctx.fillStyle = g;
+    ctx.fillRect(S.mx - R, S.my - R, R * 2, R * 2);
+  }
+  if (S.maskOn && clear > 0.02) {
+    ctx.globalCompositeOperation = 'color-dodge';
+    ctx.globalAlpha = clamp(S.restA, 0, 1);
+    ctx.drawImage(S.layer, 0, 0, S.layer.width, S.layer.height, S.lx, S.ly, S.lw, S.lw);
+  }
+  ctx.restore();
+}
+
+// The far lighthouse's light, drawn after the lighting pass so the night grade cannot turn it
+// cold and grey. Things in front of it (an island, the raft, the boy) still hide it: the beam
+// fades out before it reaches them and the lamp dims when it is behind land.
+const LHB = { c: null, g: null };
+function drawLighthouseLight(ctx, G, v, u, sea, now, night) {
+  const W = v.cssW;
+  const lh = lighthouseGeom(G, u, W);
+  const la0 = lh.vis * smoothstep(0.25, 0.75, night);
+  if (la0 < 0.01 || !(sea > 10) || sea > v.cssH + 80 || !SPR.beam) return;
+  const s = lh.s, lx = lh.x, ly = sea - 27.8 * s;
+  const sc = v.scale, cxs = W / 2;
+  const lampWy = (ly - sea) / sc;                      // world height of the lamp above the sea
+  const R = G.raft, P = G.player;
+  const r0 = R && R.tiles && isFinite(R.x) ? R.x - 4 : null;
+  const r1 = r0 != null ? R.x + R.tiles.length * C.TILE_W + 4 : null;
+  const pAbove = P && isFinite(P.x) && isFinite(P.y) && P.y < 6;
+  const blocked = (sx) => {
+    const wx = G.cam.x + (sx - cxs) / sc;
+    if (r0 != null && wx > r0 && wx < r1) return true;
+    if (pAbove && Math.abs(wx - P.x) < 12) return true;
+    let gy = null;
+    try { gy = islandGroundAt(G, wx); } catch (e) { gy = null; }
+    return gy != null && gy < lampWy + 4;
+  };
+  const lampVis = (blocked(lx) ? 0 : 0.5) + (blocked(lx - 3 * s) || blocked(lx + 3 * s) ? 0 : 0.5);
+  const la = la0 * lampVis;
+  if (la < 0.01) return;
+  const th = now * 1.15;
+  const c = Math.cos(th), ac = Math.abs(c), face = Math.pow(Math.max(0, Math.sin(th)), 6);
+  const warm = [255, 222, 158];
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  // the beam: projected length shrinks as it swings toward / away from us
+  const len = (110 + 560 * ac) * s;
+  const dir = c >= 0 ? 1 : -1;
+  const half = (5 + 30 * ac) * s;
+  let reach = len;
+  const stepPx = 10;
+  for (let d = stepPx; d < len; d += stepPx) {
+    const sx = lx + dir * d;
+    if (sx < -20 || sx > W + 20) break;
+    if (blocked(sx)) { reach = d; break; }
+  }
+  const beamA = la * (0.3 + 0.7 * ac);
+  if (reach > 12 * s && beamA > 0.01) {
+    const k = 0.5;
+    const bw = Math.max(8, Math.ceil(len * k)), bh = Math.max(8, Math.ceil(half * 2 * k));
+    if (!LHB.c) { LHB.c = makeCanvas(bw, bh); LHB.g = LHB.c.getContext('2d'); }
+    const b = LHB.c, g = LHB.g;
+    if (b.width < bw || b.height < bh) { b.width = Math.max(b.width, bw); b.height = Math.max(b.height, bh); }
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalCompositeOperation = 'source-over';
+    g.globalAlpha = 1;
+    g.clearRect(0, 0, bw, bh);
+    g.drawImage(SPR.beam, 0, 0, bw, bh);
+    if (reach < len) {
+      // feather the beam out before whatever stands in front of it
+      const e = reach * k, f = Math.min(e * 0.6, 70 * k * u);
+      const fg = g.createLinearGradient(e - f, 0, e, 0);
+      fg.addColorStop(0, 'rgba(0,0,0,1)');
+      fg.addColorStop(1, 'rgba(0,0,0,0)');
+      g.globalCompositeOperation = 'destination-in';
+      g.fillStyle = fg;
+      g.fillRect(0, 0, bw, bh);
+    }
+    ctx.translate(lx, ly);
+    ctx.rotate(dir > 0 ? -0.035 : Math.PI + 0.035);
+    ctx.globalAlpha = clamp(beamA, 0, 1);
+    ctx.drawImage(b, 0, 0, bw, bh, 0, -half, len, half * 2);
+  }
+  ctx.restore();
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  // the lamp: a hot core, a soft warm glow, and the flash when the beam faces us
+  const gr = (18 + 64 * face) * s;
+  const g2 = ctx.createRadialGradient(lx, ly, 0, lx, ly, gr);
+  g2.addColorStop(0, rgbaS([255, 248, 226], la));
+  g2.addColorStop(0.1, rgbaS([255, 232, 184], la * (0.7 + 0.3 * face)));
+  g2.addColorStop(0.35, rgbaS(warm, la * (0.2 + 0.32 * face)));
+  g2.addColorStop(0.7, rgbaS([255, 200, 140], la * 0.05 * (1 + face)));
+  g2.addColorStop(1, rgbaS([255, 190, 130], 0));
+  ctx.fillStyle = g2;
+  ctx.fillRect(lx - gr, ly - gr, gr * 2, gr * 2);
+  if (face > 0.05) {
+    const fw = 120 * s * face, fh = 2.2 * s;
+    const fg = ctx.createLinearGradient(lx - fw, 0, lx + fw, 0);
+    fg.addColorStop(0, rgbaS(warm, 0));
+    fg.addColorStop(0.5, rgbaS(warm, la * face * 0.75));
+    fg.addColorStop(1, rgbaS(warm, 0));
+    ctx.fillStyle = fg;
+    ctx.fillRect(lx - fw, ly - fh / 2, fw * 2, fh);
+  }
+  ctx.restore();
 }
 
 function drawShafts(ctx, G, v, st, pal, u, sea, W) {
@@ -1871,10 +2063,14 @@ function drawShafts(ctx, G, v, st, pal, u, sea, W) {
 
 function drawStrip(ctx, s, off, u, sea, W, alpha, yOff) {
   if (alpha < 0.01) return;
-  const sw = s.w * u, sh = s.h * u;
-  let x = -pmod(off, sw);
+  const sw = s.w * u, sh = s.h * u, y = sea - sh + (yOff || 0);
+  const x0 = -pmod(off, sw);
   ctx.globalAlpha = alpha;
-  for (; x < W; x += sw) ctx.drawImage(s.tinted, x, sea - sh + (yOff || 0), sw + 0.5, sh);
+  for (let x = x0; x < W; x += sw) {
+    ctx.drawImage(s.tinted, x, y, sw + 0.5, sh);
+    occlude(s.tinted, x, y, sw + 0.5, sh, alpha, null);
+  }
+  occludeStrip(s, x0, sw, u, sea, yOff || 0, alpha);
   ctx.globalAlpha = 1;
 }
 
@@ -1905,7 +2101,7 @@ function lighthouseGeom(G, u, W) {
   return { vis, x: W * lerp(0.93, 0.78, k), s: lerp(1.05, 1.55, k) * u };
 }
 
-function drawLighthouse(ctx, G, pal, u, sea, W, now) {
+function drawLighthouse(ctx, G, pal, u, sea, W) {
   const lh = lighthouseGeom(G, u, W);
   const vis = lh.vis;
   if (vis < 0.01) return;
@@ -1938,52 +2134,17 @@ function drawLighthouse(ctx, G, pal, u, sea, W, now) {
   ctx.lineTo(x + 2 * s, sea - 29.4 * s);
   ctx.fill();
   ctx.globalAlpha = 1;
-  // the light
-  const la = vis * smoothstep(0.25, 0.75, night);
-  if (la < 0.01) return;
-  const lx = x, ly = sea - 27.8 * s;
-  const th = now * 1.15;
-  const c = Math.cos(th), face = Math.pow(Math.max(0, Math.sin(th)), 6);
-  const warm = [255, 226, 160];
-  ctx.globalCompositeOperation = 'lighter';
-  // beam: projected length shrinks as it swings toward / away from us
-  const len = (110 + 560 * Math.abs(c)) * s;
-  const dir = c >= 0 ? 1 : -1;
-  const half = (4 + 30 * Math.abs(c)) * s;
-  const ex = lx + dir * len, ey = ly - len * 0.035;
-  const g = ctx.createLinearGradient(lx, ly, ex, ey);
-  g.addColorStop(0, rgbaS(warm, 0.8 * la * (0.35 + 0.65 * Math.abs(c))));
-  g.addColorStop(0.45, rgbaS(warm, 0.25 * la * Math.abs(c)));
-  g.addColorStop(1, rgbaS(warm, 0));
-  ctx.fillStyle = g;
-  ctx.beginPath();
-  ctx.moveTo(lx, ly - 0.8 * s);
-  ctx.lineTo(ex, ey - half);
-  ctx.lineTo(ex, ey + half * 0.7);
-  ctx.lineTo(lx, ly + 0.8 * s);
-  ctx.closePath();
-  ctx.fill();
-  // lamp glow and the flash when the beam faces us
-  const gr = (16 + 60 * face) * s;
-  const g2 = ctx.createRadialGradient(lx, ly, 0, lx, ly, gr);
-  g2.addColorStop(0, rgbaS([255, 250, 232], la));
-  g2.addColorStop(0.12, rgbaS([255, 236, 190], la * (0.75 + 0.25 * face)));
-  g2.addColorStop(0.4, rgbaS(warm, la * (0.22 + 0.35 * face)));
-  g2.addColorStop(1, rgbaS(warm, 0));
-  ctx.fillStyle = g2;
-  ctx.fillRect(lx - gr, ly - gr, gr * 2, gr * 2);
-  if (face > 0.05) {
-    ctx.fillStyle = rgbaS(warm, la * face * 0.7);
-    ctx.fillRect(lx - 110 * s * face, ly - 0.7 * s, 220 * s * face, 1.4 * s);
-  }
-  ctx.globalCompositeOperation = 'source-over';
+  // its light is drawn by drawWeather, after the lighting pass (drawLighthouseLight)
 }
 
 export function drawSky(ctx, G) {
   const v = G.view;
   const sea = v.seaScreenY;
-  if (!(sea > 0) || !(v.cssW > 0)) return;
-  if (!buildOnce()) return;
+  resetStamp();
+  if (!(v.cssW > 0) || !buildOnce()) return;
+  // the remaining cloud sprites bake a slice per frame (the title screen can spare more)
+  pumpBake(G.mode === 'title' ? 9 : 5);
+  if (!(sea > 0)) return;
   const st = ensureState(G);
   const W = v.cssW, u = unitOf(v);
   const H = Math.min(v.cssH, sea + 4);
@@ -2013,9 +2174,20 @@ export function drawSky(ctx, G) {
 
   // 4. sun (behind clouds) and moon
   const sunA = pal.sunA * smoothstep(-0.06, 0.02, sun.e);
-  if (sun.e > -0.1 && sun.y - sun.r * 12 < H) drawSunBehind(ctx, sun, pal, sunA, sunCol);
+  if (sun.e > -0.1 && sun.y - sun.r * 12 < H) {
+    drawSunBehind(ctx, sun, pal, sunA, sunCol);
+    STAMP.sunOn = true; STAMP.sx = sun.x; STAMP.sy = sun.y; STAMP.sr = sun.r;
+    STAMP.sunOcc = islandCover(G, v, sun.x, sun.y, sun.r);
+  }
   const moonA = pal.moonA * (1 - smoothstep(0.15, 0.6, pal.light)) * smoothstep(-0.05, 0.03, moon.e) * (1 - base.nightImg);
-  if (moonA > 0.01) drawMoon(ctx, moon, moonA, pal.night);
+  if (moonA > 0.01) {
+    drawMoon(ctx, moon, moonA, pal.night);
+    // at night the moon is re-lit after the lighting pass (drawWeather); low on the horizon
+    // things stand in front of it, so it is left alone there
+    const restA = moonA * pal.night * (1 - pal.gloom) * smoothstep(20 * u, 90 * u, sea - moon.y) * (moon.y > -moon.r * 2 ? 1 : 0);
+    prepareMoonMask(v, moon, restA);
+    STAMP.moonOcc = islandCover(G, v, moon.x, moon.y, moon.r);
+  }
 
   // 5. cirrus and clouds
   drawCirrus(ctx, G, v, st, u, sea, W, cloudA * (0.85 - 0.6 * S) * lerp(1, 0.7, pal.night));
@@ -2034,7 +2206,7 @@ export function drawSky(ctx, G) {
     drawStrip(ctx, SPR.mtnBack, G.cam.x * v.scale * 0.012 + 300, u, sea, W, mtnA * 0.95, 2 * u);
     drawStrip(ctx, SPR.mtnFront, G.cam.x * v.scale * 0.02 + 900, u, sea, W, mtnA, 1.5 * u);
   }
-  drawLighthouse(ctx, G, pal, u, sea, W, now);
+  drawLighthouse(ctx, G, pal, u, sea, W);
   // a soft line of haze along the horizon
   const hzA = 0.35 + 0.35 * (G.weather.fog || 0);
   const hg = ctx.createLinearGradient(0, sea - 26 * u, 0, sea + 4);
@@ -2157,20 +2329,29 @@ function drawRain(ctx, G, v, u, sea, now, light, L) {
   }
 }
 
-function drawFogBanks(ctx, G, v, pal, u, sea, now) {
+// How thick the fog banks look. By day a bright sky gives them little contrast, so the day
+// term is nearly as strong as the night one.
+function fogStrength(G, night) {
   const W = G.weather;
   const f = clamp((W.fog || 0) + (W.rain || 0) * 0.2, 0, 1);
-  if (f < 0.02 || sea < -150 * u || !SPR.fog.length) return;
+  return f < 0.02 ? 0 : f * (0.82 + 0.18 * night);
+}
+function drawFogBanks(ctx, G, v, pal, u, sea, now) {
+  const W = G.weather;
+  if (sea < -150 * u || !SPR.fog.length) return;
   const night = pal.night;
-  const strength = f * (0.45 + 0.55 * night);
+  const strength = fogStrength(G, night);
   if (strength < 0.035) return;
   const fc = pal.fogC;
   // haze wall over the sea surface
   const top = sea - 280 * u, bot = sea + 220 * u;
   const g = ctx.createLinearGradient(0, top, 0, bot);
+  const dayK = 1 - night;
   g.addColorStop(0, rgbaS(fc, 0));
-  g.addColorStop(0.45, rgbaS(fc, 0.3 * strength));
-  g.addColorStop(0.56, rgbaS(fc, 0.24 * strength));
+  g.addColorStop(0.3, rgbaS(fc, (0.12 + 0.1 * dayK) * strength));
+  g.addColorStop(0.45, rgbaS(fc, (0.3 + 0.14 * dayK) * strength));
+  g.addColorStop(0.56, rgbaS(fc, (0.24 + 0.16 * dayK) * strength));
+  g.addColorStop(0.8, rgbaS(fc, 0.08 * dayK * strength));
   g.addColorStop(1, rgbaS(fc, 0));
   ctx.fillStyle = g;
   ctx.fillRect(0, Math.max(0, top), v.cssW, bot - Math.max(0, top));
@@ -2186,7 +2367,7 @@ function drawFogBanks(ctx, G, v, pal, u, sea, now) {
     const off = G.cam.x * v.scale * par - now * speed + i * 517;
     const y = sea + bands[i] * u - sh / 2;
     if (y > v.cssH || y + sh < 0) continue;
-    ctx.globalAlpha = clamp(strength * (i < 2 ? 0.42 : 0.26 - 0.03 * i), 0, 0.8);
+    ctx.globalAlpha = clamp(strength * (i < 2 ? 0.42 : 0.26 - 0.03 * i) * (1 + 0.35 * (1 - night)), 0, 0.8);
     for (let x = -pmod(off, sw); x < v.cssW; x += sw) ctx.drawImage(spr.tinted, x, y, sw + 0.5, sh);
   }
   ctx.globalAlpha = 1;
@@ -2228,6 +2409,11 @@ function drawBolt(ctx, G, v, st, u, sea, L) {
   ctx.restore();
 }
 
+// "How night does the sky look" (from the painted zenith), without building a palette.
+function skyNight(G) {
+  return 1 - smoothstep(20, 75, luma(sampleKeys(SKY_KEYS, G.phase || 0)[0]));
+}
+
 export function drawWeather(ctx, G) {
   const v = G.view;
   if (!(v.cssW > 0) || !buildOnce()) return;
@@ -2237,7 +2423,12 @@ export function drawWeather(ctx, G) {
   const now = performance.now() / 1000;
   const light = G.light == null ? 1 : G.light;
   const L = W.lightning || 0;
-  const needFog = ((W.fog || 0) + (W.rain || 0) * 0.2) * (0.45 + 0.55 * nightOf(G)) >= 0.035;
+  // the lights of the night sky come back after the darkness pass: the moon, the far lighthouse
+  drawMoonRestamp(ctx);
+  const night = skyNight(G);
+  drawLighthouseLight(ctx, G, v, u, sea, now, night);
+
+  const needFog = fogStrength(G, night) >= 0.035;
   if (!needFog && (W.rain || 0) < 0.01 && L < 0.01) return;
   const pal = needFog ? computePalette(G, st) : null;
 

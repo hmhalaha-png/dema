@@ -220,7 +220,7 @@ const PAL = {
   dawn: { surf: [58, 76, 106], mid: [26, 42, 72], deep: [9, 16, 32], abyss: [2, 5, 12], haze: [232, 168, 156], band: [112, 104, 132], line: [255, 216, 204], glint: [255, 210, 182], ray: [255, 196, 172], rayA: 0.05, sil: [6, 10, 26], tint: [44, 60, 98], foam: [238, 226, 232], snow: [210, 200, 220] },
   morn: { surf: [82, 138, 150], mid: [30, 86, 108], deep: [9, 32, 50], abyss: [3, 10, 18], haze: [246, 218, 184], band: [128, 154, 158], line: [255, 242, 220], glint: [255, 236, 200], ray: [255, 236, 204], rayA: 0.18, sil: [4, 20, 32], tint: [40, 108, 122], foam: [242, 242, 236], snow: [214, 232, 226] },
   day: { surf: [66, 142, 152], mid: [22, 88, 108], deep: [7, 31, 47], abyss: [2, 9, 16], haze: [212, 226, 216], band: [104, 160, 166], line: [236, 252, 246], glint: [255, 253, 236], ray: [218, 252, 238], rayA: 0.22, sil: [3, 22, 34], tint: [26, 112, 128], foam: [246, 252, 250], snow: [214, 238, 232] },
-  gold: { surf: [74, 88, 124], mid: [28, 38, 76], deep: [9, 16, 36], abyss: [3, 7, 16], haze: [252, 214, 164], band: [208, 172, 150], line: [255, 236, 204], glint: [255, 226, 168], ray: [255, 220, 178], rayA: 0.17, sil: [8, 12, 30], tint: [84, 90, 126], foam: [252, 242, 226], snow: [230, 226, 206] },
+  gold: { surf: [116, 100, 106], mid: [30, 38, 74], deep: [9, 16, 36], abyss: [3, 7, 16], haze: [252, 214, 164], band: [208, 172, 150], line: [255, 236, 204], glint: [255, 226, 168], ray: [255, 220, 178], rayA: 0.17, sil: [8, 12, 30], tint: [84, 90, 126], foam: [252, 242, 226], snow: [230, 226, 206] },
   dusk: { surf: [124, 72, 94], mid: [44, 28, 62], deep: [14, 10, 28], abyss: [5, 4, 12], haze: [246, 172, 144], band: [166, 104, 120], line: [255, 204, 180], glint: [255, 196, 156], ray: [255, 176, 164], rayA: 0.06, sil: [14, 8, 24], tint: [88, 52, 86], foam: [252, 222, 216], snow: [222, 190, 206] },
   night: { surf: [17, 31, 58], mid: [8, 17, 37], deep: [3, 7, 17], abyss: [1, 2, 7], haze: [42, 56, 96], band: [24, 38, 70], line: [152, 182, 228], glint: [210, 226, 255], ray: [164, 194, 244], rayA: 0.04, sil: [1, 3, 10], tint: [12, 26, 58], foam: [172, 192, 222], snow: [150, 180, 220] },
 };
@@ -256,6 +256,10 @@ function palette(G) {
     const fc = [170, 180, 184].map((c) => c * (0.25 + 0.75 * (G.light == null ? 1 : G.light)));
     p.haze = mixColor(p.haze, fc, fog * 0.7);
     p.band = mixColor(p.band, fc, fog * 0.5);
+    // the water column greys in fog too (darker than the air: the light is scattered away)
+    p.surf = mixColor(p.surf, fc.map((c) => c * 0.62), fog * 0.5);
+    p.mid = mixColor(p.mid, fc.map((c) => c * 0.3), fog * 0.35);
+    p.tint = mixColor(p.tint, fc.map((c) => c * 0.5), fog * 0.4);
   }
   p.day = clamp(((G.light == null ? 1 : G.light) - 0.12) / 0.88, 0, 1);
   p.night = nightness(G);
@@ -660,11 +664,22 @@ export function drawBackdrop(ctx, G) {
 
   if (sy0 < H + 2) {
     const top = Math.max(0, sy0);
-    // ---- water body
+    // ---- water body. Around a low sun the top of the water mirrors the warm horizon sky
+    // (golden hour, dawn), fading out ~15% of the way down.
+    const hzc = cel.horizon;
+    let gw = 0;
+    if (Array.isArray(hzc) && isFinite(hzc[0]) && isFinite(cel.sunE)) {
+      const e = cel.sunE;
+      const lowSun = smoothstep(-0.3, -0.02, e) * (1 - smoothstep(0.08, 0.45, e));
+      const fog = (G.weather && G.weather.fog) || 0;
+      gw = (1 - P.night) * lowSun * (1 - S_(G).storm * 0.85) * (1 - fog * 0.7);
+    }
+    const warmTop = (c, k) => (gw > 0.01 ? mixColor(c, hzc, k * gw) : c);
     const g = ctx.createLinearGradient(0, sy0, 0, sy0 + 1150 * sc);
-    g.addColorStop(0, rgb(P.surf));
-    g.addColorStop(0.03, rgb(mixColor(P.surf, P.mid, 0.18)));
-    g.addColorStop(0.12, rgb(mixColor(P.surf, P.mid, 0.75)));
+    g.addColorStop(0, rgb(warmTop(P.surf, 0.52)));
+    g.addColorStop(0.03, rgb(warmTop(mixColor(P.surf, P.mid, 0.18), 0.36)));
+    g.addColorStop(0.075, rgb(warmTop(mixColor(P.surf, P.mid, 0.45), 0.17)));
+    g.addColorStop(0.12, rgb(warmTop(mixColor(P.surf, P.mid, 0.75), 0.07)));
     g.addColorStop(0.2, rgb(P.mid));
     g.addColorStop(0.5, rgb(P.deep));
     g.addColorStop(1, rgb(P.abyss));

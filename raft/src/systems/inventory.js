@@ -7,6 +7,7 @@
 import { C, say, statClamp } from '../core/state.js';
 import { TAU, seeded, makeCanvas } from '../core/util.js';
 import { sfx } from './audio.js';
+import { hint } from '../core/input.js';
 
 // =====================================================================================
 // registry
@@ -31,7 +32,8 @@ const DEFS = {
   water:       { name: '淡水',     cat: 'food', desc: '四周全是水，只有这一点能喝。', use: { thirst: 40 } },
   bandage:     { name: '绷带',     cat: 'food', desc: '把伤口缠起来，会好受很多。', use: { hp: 30 } },
 
-  hook:        { name: '钩索',     cat: 'tool', desc: '按住蓄力，松开抛出；钩住漂流物以后再按住，把它收回来。' },
+  hook:        { name: '钩索',     cat: 'tool',
+    get desc() { return hint('按住鼠标左键蓄力，松开抛出；钩住漂流物以后再按住，把它收回来。', '按住「使用」蓄力，松开抛出；钩住漂流物以后再按住，把它收回来。'); } },
   spear:       { name: '鱼叉',     cat: 'tool', desc: '刺鱼用的，也能把鲨鱼赶走。水下也能用。' },
   hammer:      { name: '锤子',     cat: 'tool', desc: '扩建、修补木筏，安装做好的东西。' },
   lantern:     { name: '提灯',     cat: 'tool', desc: '夜里和深水里会自己点亮。黑暗里的东西怕光。' },
@@ -40,7 +42,7 @@ const DEFS = {
   purifier:    { name: '净水器',   cat: 'placeable', desc: '让太阳把海水晒成淡水。下雨时接得更快。' },
   grill:       { name: '烤架',     cat: 'placeable', desc: '把生鱼烤熟。每次要烧掉一块木板。' },
   sail:        { name: '船帆',     cat: 'placeable', desc: '升起来，木筏会漂得快很多。' },
-  lamp:        { name: '灯柱',     cat: 'placeable', desc: '夜里点亮它，黑暗里的东西会离木筏远一点。' },
+  lamp:        { name: '灯柱',     cat: 'placeable', desc: '夜里点亮它，鲨鱼就不敢来咬木筏；岛上林子里的东西也怕它的光。' },
   bed:         { name: '吊床',     cat: 'placeable', desc: '天黑以后躺上去，一觉睡到天亮。' },
 
   note:        { name: '漂流瓶信', cat: 'story', desc: '一个叫小满的女孩写的信。在日记里可以重新读。' },
@@ -52,7 +54,9 @@ const DEFS = {
 
 export const ITEMS = {};
 for (const [id, d] of Object.entries(DEFS)) {
-  ITEMS[id] = Object.assign({ id }, d, { category: d.cat });
+  // copy property descriptors so texts that are getters (they follow keyboard vs touch) stay live
+  ITEMS[id] = Object.defineProperties({ id }, Object.getOwnPropertyDescriptors(d));
+  ITEMS[id].category = d.cat;
   Object.defineProperty(ITEMS[id], 'icon', { enumerable: false, get: () => iconURL(id) });
 }
 

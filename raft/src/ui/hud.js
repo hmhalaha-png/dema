@@ -6,16 +6,17 @@
 // warm lantern light only for what matters. Everything is plain DOM + CSS injected here;
 // nothing is redrawn unless it changed, so the HUD costs almost nothing per frame.
 
-import { C, say, journal, isNight } from '../core/state.js';
-import { input, bindTouchButton } from '../core/input.js';
+import { C, say, journal, isNight, syncTime } from '../core/state.js';
+import { input, bindTouchButton, hint, swallowInput } from '../core/input.js';
 import { worldToScreen } from '../core/world.js';
-import { loadGame } from '../core/save.js';
+import { loadGame, isSafeToSave } from '../core/save.js';
 import { clamp, seeded, makeCanvas, TAU } from '../core/util.js';
 import { CODEX, CODEX_IDS } from '../data/codex.js';
 import { getAsset } from '../core/assets.js';
 import { ITEMS, ITEM_ORDER, CATEGORY_NAMES, count, useItem, iconURL, itemName, ink } from '../systems/inventory.js';
 import { RECIPES, RECIPE_ORDER, craft, blockReason } from '../systems/craft.js';
 import { sfx, unlockAudio, setMuted, isMuted } from '../systems/audio.js';
+import { debugWeather } from '../render/sky.js';
 
 let API = null;
 let U = null;            // root element inside #ui
@@ -27,7 +28,9 @@ const S = {              // UI runtime
   hurt: 0, hurtShown: -1, lastHp: null, playT: 0,
   bagSig: '', jSig: '', jTab: 'diary', detail: null, madeId: null, madeT: 0, usedId: null, usedT: 0,
   intro: null, cont: null, dayCard: null, lastDay: null, pending: null,
-  end: null, deadInfo: null, menuSel: 0, confirmNew: 0, muted: false, deadAt: null, saveFlashT: 0, fontFallback: false,
+  end: null, deadInfo: null, menuSel: 0, confirmNew: 0, confirmNewOn: false, confirmRestart: 0, confirmRestartOn: false,
+  muted: false, deadAt: null, saveFlashT: 0, fontFallback: false, titleAt: -99,
+  pmsgT: 0, hookFloatT: 0, matBase: null, downEl: null, saveFlashDur: 2,
 };
 const MUTE_KEY = 'shaonian-yu-hai:muted';
 const FONT_BRUSH = '"Ma Shan Zheng","Noto Serif SC","Songti SC","STSong","SimSun",serif';
@@ -49,6 +52,8 @@ const flags = (G) => {
   return G.persist.flags || (G.persist.flags = {});
 };
 const isTouch = () => !!(input.touch || S.coarse);
+// Control wording for keyboard vs touchscreen. A phone counts as touch before its first tap too.
+const hk = (keyboard, touch) => (S.touch ? touch : hint(keyboard, touch));
 const fmtDist = (G) => {
   const x = G.raft && Number.isFinite(G.raft.x) ? G.raft.x : 0;
   const nm = Math.max(0, (C.GOAL_X - x) / 100);
@@ -56,6 +61,11 @@ const fmtDist = (G) => {
 };
 const lettersFound = (G) => (G.persist && G.persist.flags && G.persist.flags.notes) | 0;
 const codexFound = (G) => CODEX_IDS.filter((id) => G.codex && G.codex[id]).length;
+
+// A click only counts where its press began. On a phone the tap that opens a panel or menu
+// (背包, 图鉴, 暂停) ends with a click that lands on whatever just appeared under the finger;
+// without this it would close the panel again, or press a button in it.
+const pressedOn = (el) => !!(el && S.downEl && el.contains(S.downEl));
 
 function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
 function toggle(el, cls, on) { if (el && el.classList.contains(cls) !== !!on) el.classList.toggle(cls, !!on); }
@@ -581,7 +591,7 @@ function css(tex) {
 .torn svg .base{stroke:currentColor;stroke-width:.8;fill:none}
 .tmenu{position:absolute;left:0;right:0;bottom:calc(13vh + var(--sb));animation:u-fade 1.6s 1.8s both}
 .tfoot{position:absolute;left:0;right:0;bottom:calc(7vh + .7em + var(--sb));text-align:center;font-size:.74em;letter-spacing:.3em;color:rgba(236,226,204,.5);animation:u-fade 2s 2.6s both}
-.howto{position:absolute;left:calc(1.6em + var(--sl));bottom:calc(9vh + var(--sb));width:17em;padding:.9em 1.1em 1em;color:var(--ink2);font-size:.82em;
+.howto{position:absolute;left:calc(1.6em + var(--sl));bottom:calc(9vh + var(--sb));width:18.5em;padding:.9em 1.1em 1em;color:var(--ink2);font-size:.82em;
  background:rgba(9,10,13,.62);border:1px solid rgba(236,226,204,.1);border-radius:.6em 1em .7em .9em/.9em .6em 1em .7em;animation:u-fade 2s 2.2s both;transition:opacity .3s}
 .howto h4{margin:0 0 .45em;font-family:var(--fd);font-weight:400;font-size:1.25em;letter-spacing:.2em;color:var(--ink)}
 .kr{display:flex;gap:.7em;align-items:center;line-height:1.85}
@@ -682,8 +692,7 @@ function css(tex) {
 @keyframes u-pulse{0%,100%{opacity:.55}50%{opacity:1}}
 
 .toasts{position:absolute;left:50%;top:calc(12px + var(--st));transform:translateX(-50%);width:min(34em,56vw);display:flex;flex-direction:column;align-items:center;gap:.38em;z-index:9;pointer-events:none;transition:opacity .3s}
-.U[data-mode=pause] .toasts,.U[data-mode=dead] .toasts,.U[data-mode=ending] .toasts,.U[data-mode=title] .toasts{opacity:0}
-.U[data-mode=panel] .toast:not(:nth-last-child(-n+2)){display:none}
+.U[data-mode=pause] .toasts,.U[data-mode=dead] .toasts,.U[data-mode=ending] .toasts,.U[data-mode=title] .toasts,.U[data-mode=panel] .toasts{opacity:0}
 .toast{max-width:100%;padding:.42em 1.05em;font-size:.95em;line-height:1.45;text-align:center;color:var(--ink);background:rgba(11,12,16,.8);border:1px solid rgba(236,226,204,.13);
  border-radius:.6em .9em .7em .8em/.8em .6em .9em .7em;box-shadow:0 6px 18px rgba(0,0,0,.38);opacity:0;transform:translateY(-.5em);transition:opacity .35s,transform .35s}
 .toast.on{opacity:1;transform:none}
@@ -737,6 +746,9 @@ function css(tex) {
 .craftp header,.journalp header{position:relative;z-index:2;display:flex;align-items:baseline;gap:.9em;padding:.9em 1.6em .2em}
 .craftp h2,.pause h2{margin:0;font-family:var(--fd);font-weight:400;font-size:2em;letter-spacing:.24em;line-height:1.1;color:var(--ink)}
 .craftp header span{font-size:.82em;color:var(--ink3)}
+.craftp header .pmsg{flex:1;min-width:0;margin-right:2.6em;text-align:right;font-size:.84em;color:#f0dcb4;opacity:0;transition:opacity .3s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.craftp header .pmsg.on{opacity:1}
+.craftp header .pmsg.warn{color:#e9a493}
 .craftp .cols{position:relative;z-index:2;flex:1;min-height:0;display:flex;gap:1.1em;padding:.5em 1.4em 0}
 .craftp footer{position:relative;z-index:2;padding:.45em 1.6em .8em;font-size:.76em;color:var(--ink3)}
 .craftp h3{margin:.5em 0 .35em;font-weight:400;font-size:.8em;letter-spacing:.32em;color:var(--ink3);display:flex;align-items:center;gap:.6em}
@@ -761,6 +773,11 @@ function css(tex) {
 .detail b small{font-family:var(--fb);font-size:.62em;color:var(--ink3);letter-spacing:.1em;margin-left:.6em}
 .detail p{margin:.1em 0 0;font-size:.84em;color:var(--ink2);line-height:1.45}
 .detail .eff{color:#9fc4a0}
+.detail>div{flex:1;min-width:0}
+.dbtn{flex:none;align-self:center;min-width:3.4em;min-height:2.4em;padding:.3em .8em;font-family:var(--fd);font-size:1.1em;letter-spacing:.2em;color:var(--pink);
+ background:linear-gradient(#e9d6a8,#c8a96c);border-radius:.4em .55em .38em .5em/.5em .38em .55em .4em;box-shadow:0 3px 0 #5e4526,0 4px 10px rgba(0,0,0,.4)}
+.dbtn:active{transform:translateY(2px);box-shadow:0 1px 0 #5e4526}
+.U.tmode .dbtn{min-width:56px;min-height:44px}
 .recipes{flex:1;display:flex;flex-direction:column;min-height:0}
 .recipes .scroll{flex:1;min-height:0;padding-right:.35em}
 .rrow{position:relative;display:flex;align-items:center;gap:.75em;padding:.5em .6em .5em .5em;margin-bottom:.38em;border-radius:.45em .7em .5em .6em/.6em .45em .7em .5em;
@@ -856,36 +873,33 @@ function css(tex) {
 .dead.go .dcon h2{transition-delay:1s}.dead.go .dline{transition-delay:2.4s}.dead.go .dstat{transition-delay:3.2s}.dead.go .menu{transition-delay:3.8s}
 .dead:not(.ready) .mb{pointer-events:none}
 .dead .mb{color:rgba(214,224,230,.6)}.dead .mb.sel,.dead .mb:hover{color:#eef4f6}
+.dead .mb.warn{color:#e7b0a2}
+.dead.dry .bub{display:none}
+.dead.dry{background:linear-gradient(180deg,rgba(14,10,8,.5),rgba(6,4,3,.92) 60%,#030201)}
 
 /* ---------------------------------------------------------------- ending */
-.ending{z-index:9;background:linear-gradient(180deg,#020306 0%,#04060b 52%,#0c0f18 84%,#111521 90%);transition:opacity 1.6s ease,visibility 0s linear 1.6s;overflow:hidden}
+.ending{z-index:9;overflow:hidden;transition:opacity 1.4s ease,visibility 0s linear 1.4s}
 .U[data-mode=pause] .pause,.U[data-mode=dead] .dead,.U[data-mode=ending] .ending{pointer-events:auto}
-.U[data-mode=ending] .ending{transition:opacity 3.5s ease,visibility 0s}
-.eglow{position:absolute;left:50%;bottom:calc(9vh + 25.4vmin);width:90vmin;height:90vmin;margin:0 0 -45vmin -45vmin;background:radial-gradient(closest-side,rgba(255,206,140,.34),rgba(255,176,96,.12) 30%,rgba(255,160,80,.04) 62%,rgba(255,160,80,0) 100%);animation:u-glow 5s ease-in-out infinite}
-@keyframes u-glow{0%,100%{opacity:.75;transform:scale(1)}50%{opacity:1;transform:scale(1.06)}}
-.estars i{position:absolute;width:2px;height:2px;border-radius:50%;background:#dfe6ff;animation:u-tw 3s ease-in-out infinite}
-@keyframes u-tw{0%,100%{opacity:.2}50%{opacity:.9}}
-.lh{position:absolute;left:50%;bottom:9vh;width:13vmin;height:30vmin;margin-left:-6.5vmin}
-.lh svg{width:100%;height:100%;overflow:visible}
-.lh .tw{fill:#07080c}.lh .lamp{fill:#ffd9a0}.lh .isl{fill:#050608}
-.beam{position:absolute;left:50%;bottom:calc(9vh + 25.4vmin);width:90vmax;height:9vmin;margin:-4.5vmin 0 0;transform-origin:0 50%;
- background:linear-gradient(90deg,rgba(255,214,150,.55),rgba(255,214,150,.12) 45%,rgba(255,214,150,0));clip-path:polygon(0 46%,100% 0,100% 100%,0 54%);animation:u-beam 7s linear infinite}
-@keyframes u-beam{0%{transform:scaleX(1);opacity:.9}25%{transform:scaleX(.02);opacity:.15}50%{transform:scaleX(-1);opacity:.9}75%{transform:scaleX(.02);opacity:.15}100%{transform:scaleX(1);opacity:.9}}
-.esea{position:absolute;left:0;right:0;bottom:0;height:10vh;background:linear-gradient(#070910,#020305)}
-.esea::before{content:'';position:absolute;left:0;right:0;top:0;height:1px;background:linear-gradient(90deg,rgba(255,214,150,0),rgba(255,214,150,.35) 50%,rgba(255,214,150,0))}
-.esea::after{content:'';position:absolute;left:50%;top:1px;width:5vmin;height:100%;margin-left:-2.5vmin;background:repeating-linear-gradient(180deg,rgba(255,214,150,.38) 0 2px,rgba(255,214,150,0) 2px 7px);-webkit-mask:linear-gradient(180deg,#000,transparent);mask:linear-gradient(180deg,#000,transparent);animation:u-glow 3s ease-in-out infinite}
-.eraft{position:absolute;left:calc(50% - 30vmin);bottom:calc(10vh - 1px);width:9vmin;height:5.6vmin;animation:u-bob 4s ease-in-out infinite}
-.eraft svg{width:100%;height:100%;overflow:visible;fill:#030406}
-.eraft .lt{fill:#ffd08a;filter:drop-shadow(0 0 3px #ffb060)}
-@keyframes u-bob{0%,100%{transform:translateY(0) rotate(-1deg)}50%{transform:translateY(.25vmin) rotate(1deg)}}
-.eline{position:absolute;left:0;right:0;top:20vh;padding:0 2em;text-align:center;font-family:var(--fd);font-size:1.75em;line-height:1.7;letter-spacing:.12em;color:#f1e6cc;text-shadow:0 2px 14px rgba(0,0,0,.9);opacity:0;transition:opacity 1.4s}
+.U[data-mode=ending] .ending{transition:opacity 1.4s ease,visibility 0s}
+.eblack{position:absolute;inset:0;background:#020306;transition:opacity 3.2s ease}
+.eblack.off{opacity:0}
+.escrim{position:absolute;inset:0;background:linear-gradient(180deg,rgba(2,3,8,.55) 0%,rgba(2,3,8,.12) 20%,rgba(2,3,8,0) 34%,rgba(2,3,8,0) 56%,rgba(2,3,8,.42) 76%,rgba(2,3,7,.8) 100%)}
+.ecdim{position:absolute;inset:0;background:radial-gradient(ellipse 60% 48% at 50% 48%,rgba(2,3,8,.58),rgba(2,3,8,.3) 70%,rgba(2,3,8,.42));opacity:0;transition:opacity 2.6s}
+.ending.cred .ecdim{opacity:1}
+.ending .bars::before{transform:translateY(-100%)}.ending .bars::after{transform:translateY(100%)}
+.U[data-mode=ending] .ending .bars::before,.U[data-mode=ending] .ending .bars::after{transform:none;transition-delay:1.2s}
+.eline{position:absolute;left:0;right:0;bottom:calc(10vh + var(--sb));padding:0 1.5em;text-align:center;font-family:var(--fd);font-size:1.6em;line-height:1.7;letter-spacing:.12em;color:#f1e6cc;
+ text-shadow:0 2px 14px rgba(0,0,0,.95),0 0 4px rgba(0,0,0,.85);opacity:0;transition:opacity 1.4s}
 .eline.on{opacity:1}
-.ecred{position:absolute;left:0;right:0;top:12vh;display:flex;flex-direction:column;align-items:center;text-align:center;opacity:0;visibility:hidden;transition:opacity 2.4s,visibility 0s 2.4s}
+.ecred{position:absolute;left:0;right:0;top:50%;transform:translateY(-52%);display:flex;flex-direction:column;align-items:center;text-align:center;opacity:0;visibility:hidden;transition:opacity 2.4s,visibility 0s 2.4s}
 .ecred.on{opacity:1;visibility:visible;transition:opacity 2.4s}
 .ecred h1{margin:0;font-family:var(--fd);font-weight:400;font-size:clamp(40px,10vmin,96px);letter-spacing:.16em;margin-right:-.16em;color:#efe4ca;text-shadow:0 0 .6em rgba(255,196,120,.25)}
 .ecred p{margin:.3em 0;font-size:.95em;letter-spacing:.2em;color:rgba(236,226,204,.65)}
 .ecred .thx{margin:1em 0 1.2em;font-family:var(--fd);font-size:1.7em;letter-spacing:.4em;color:var(--warm);text-shadow:0 0 18px rgba(255,170,90,.4)}
-.eskip{position:absolute;right:calc(1.4em + var(--sr));bottom:calc(1.2em + var(--sb));font-size:.74em;letter-spacing:.2em;color:rgba(236,226,204,.3)}
+.ecred .menu{opacity:0;transition:opacity 1.2s}
+.ending.ready .ecred .menu{opacity:1}
+.ending:not(.ready) .ecred .mb{pointer-events:none}
+.eskip{position:absolute;right:calc(1.4em + var(--sr));bottom:calc(1.2em + var(--sb));z-index:2;font-size:.74em;letter-spacing:.2em;color:rgba(236,226,204,.38)}
 
 /* ---------------------------------------------------------------- touch */
 .touch{position:absolute;inset:0;pointer-events:none;display:none}
@@ -914,6 +928,9 @@ function css(tex) {
 .U.tmode .chip{height:40px;font-size:13px}
 .U.tmode .bottom{bottom:calc(8px + var(--sb))}
 .U.tmode .clock{right:calc(68px + var(--sr))}
+.U.tmode .panel .x{width:44px;height:44px;right:.25em;top:.25em}
+.U.tmode .panel .x svg{width:20px;height:20px}
+.U.tmode .tab{min-height:44px}
 
 /* ---------------------------------------------------------------- small / short screens */
 @media (max-height:560px){
@@ -923,8 +940,9 @@ function css(tex) {
  .tmenu{bottom:calc(9vh + var(--sb))}
  .tmenu .mb{font-size:1.35em}
  .tfoot{display:none}
- .howto{display:none;left:50%;bottom:auto;top:50%;transform:translate(-50%,-50%);z-index:3;width:min(24em,80vw)}
- .title.showkeys .howto{display:block}
+ .howto{display:none;left:50%;bottom:auto;top:calc(4vh + var(--st));transform:translateX(-50%);z-index:3;width:min(24em,80vw);max-height:calc(62vh - var(--st));overflow-y:auto}
+ .title.showkeys .howto{display:block;animation:none;opacity:1}
+ .title.showkeys .thead{opacity:0;transition:opacity .3s}
  .title .ht-btn{display:block}
  .bars::before,.bars::after{height:5vh}
  .pause{gap:1.5em}
@@ -933,11 +951,37 @@ function css(tex) {
  .cine .lines{top:18vh}
  .cine p{font-size:1.45em}
  .dcon h2{font-size:2.2em}
- .eline{font-size:1.35em;top:12vh}
+ .eline{font-size:1.25em;bottom:calc(8vh + var(--sb))}
+ .ecred h1{font-size:clamp(34px,9vmin,80px)}
+ .ecred .thx{margin:.5em 0 .7em}
 }
 @media (max-width:700px){
  .bag{flex-basis:46%}
  .craftp header span{display:none}
+ .pause{flex-direction:column;justify-content:center;gap:1.4em;padding:0 4vw}
+ .pinfo{text-align:center;padding:0 .5em;letter-spacing:.08em}
+ .pkeys{max-width:92vw}
+}
+/* phones in portrait and other narrow screens */
+@media (max-width:600px){
+ .U.tmode .bottom{bottom:calc(156px + var(--sb))}
+ .tb-cyc{right:auto;left:50%;margin-left:-29px;bottom:calc(22px + var(--sb))}
+ .thint{white-space:normal;text-align:center;max-width:92vw}
+ .toasts{top:calc(68px + var(--st));width:min(34em,calc(100vw - 132px))}
+ .tmenu{bottom:calc(11vh + var(--sb))}
+ .howto{display:none;left:50%;bottom:auto;top:50%;transform:translate(-50%,-50%);z-index:3;width:min(24em,88vw)}
+ .title.showkeys .howto{display:block;animation:none;opacity:1}
+ .title .ht-btn{display:block}
+ .panel{width:96vw;height:min(52em,88vh)}
+ .craftp header{padding:.8em 1.1em .2em}
+ .craftp .cols{flex-direction:column;gap:.3em;padding:.3em .9em 0}
+ .bag{flex:0 1 auto;max-height:46%}
+ .recipes{flex:1 1 0}
+ .craftp footer{padding:.4em 1.1em .7em}
+ .page{padding:.6em 1.2em 1.4em 3.9em}
+ .journalp .skin::after{left:3em}
+ .tabs{padding-left:3.4em}
+ .eline{font-size:1.3em}
 }
 `;
 }
@@ -1005,7 +1049,7 @@ function build() {
   const bar = h('div', 'bar');
   E.eat = h('button', 'chip eat', '<kbd>F</kbd><span class="cl">吃</span><img alt=""><span class="cn"></span>');
   E.drink = h('button', 'chip drink', '<kbd>R</kbd><span class="cl">喝</span><img alt=""><span class="cn"></span>');
-  E.eat.title = '吃东西（F）'; E.drink.title = '喝水（R）';
+  E.eat.title = '吃东西'; E.drink.title = '喝水';
   bindTouchButton(E.eat, 'eat'); bindTouchButton(E.drink, 'drink');
   const slots = h('div', 'slots');
   E.slots = [];
@@ -1014,7 +1058,7 @@ function build() {
     const b = h('button', 'slot', '<img alt=""><span class="k">' + (i + 1) + '</span>' + (id === 'hand' ? '<i class="lt"><img alt=""></i>' : ''));
     b.querySelector('img').src = iconURL(id);
     if (id === 'hand') b.querySelector('.lt img').src = iconURL('lantern');
-    b.title = name + '（' + (i + 1) + '）';
+    b.title = name;
     bindTouchButton(b, 'tool' + (i + 1));
     slots.appendChild(b);
     E.slots.push({ el: b, id, name });
@@ -1054,7 +1098,7 @@ function build() {
   // ---- panels
   const pw = E.pwrap = h('div', 'scr pwrap');
   const back = h('div', 'pback');
-  back.addEventListener('click', () => closePanel());
+  back.addEventListener('click', () => { if (pressedOn(back)) closePanel(); });
   pw.appendChild(back);
   pw.appendChild(buildCraftPanel());
   pw.appendChild(buildJournalPanel());
@@ -1081,30 +1125,25 @@ function build() {
   }
   const dead = E.dead = h('div', 'scr dead', bubs
     + '<div class="dcon"><h2></h2><p class="dline"></p><p class="dstat"></p><nav class="menu">'
-    + '<button class="mb" data-act="restart"><span class="mt">再试一次</span></button><button class="mb" data-act="load"><span class="mt">回到今天早上</span></button>'
+    + '<button class="mb" data-act="load"><span class="mt">回到今天早上</span></button>'
+    + '<button class="mb" data-act="restart"><span class="mt">重新开始旅程</span></button>'
     + '<button class="mb" data-act="title"><span class="mt">回到标题</span></button></nav></div>');
   E.dTitle = dead.querySelector('h2'); E.dLine = dead.querySelector('.dline'); E.dStat = dead.querySelector('.dstat');
   E.dLoad = dead.querySelector('[data-act=load]');
+  E.dRestart = dead.querySelector('[data-act=restart]');
   wireMenu(dead);
   U.appendChild(dead);
 
-  // ---- ending
-  let stars = '';
-  for (let i = 0; i < 46; i++) {
-    stars += '<i style="left:' + ((i * 53.3) % 100).toFixed(1) + '%;top:' + ((i * 29.7) % 62).toFixed(1) + '%;animation-delay:' + ((i * 0.37) % 3).toFixed(2) + 's;opacity:.4"></i>';
-  }
+  // ---- ending: only text over the live world (the lighthouse island, its beam turning in the dusk)
   const ending = E.ending = h('div', 'scr ending',
-    '<div class="estars">' + stars + '</div><div class="eglow"></div><div class="beam"></div>'
-    + '<div class="lh"><svg viewBox="0 0 40 92"><path class="isl" d="M-40 92C-20 80 0 77 10 76h22c12 1 30 6 48 16z"/>'
-    + '<path class="tw" d="M13 77 15.4 22h9.2L27 77z"/><path class="tw" d="M12 22h16v-2.4H12z"/><path class="lamp" d="M15 19.6h10v-7.4H15z"/>'
-    + '<path class="tw" d="M13.6 12.4 20 6.4l6.4 6z"/><path class="tw" d="M19.4 6.6h1.2V3h-1.2z"/></svg></div>'
-    + '<div class="esea"></div><div class="eraft"><svg viewBox="0 0 60 36"><path d="M2 30h50l-3 4H5z"/><path d="M20 30 21 2h1.4l.8 28z"/><path d="M23 4c9 5 15 13 16 24H23z" opacity=".9"/><path d="M44 30v-8.6c0-1.6 1-2.6 2.2-2.6s2.2 1 2.2 2.6V30z"/><circle cx="46.2" cy="16.6" r="2.6"/><circle class="lt" cx="51.4" cy="24.6" r="1.5"/></svg></div><div class="eline"></div>'
+    '<div class="eblack"></div><div class="escrim"></div><div class="ecdim"></div><div class="bars"></div><div class="eline"></div>'
     + '<div class="ecred"><h1>少年与海</h1><p class="es1"></p><p class="es2"></p><div class="thx">谢谢游玩</div>'
     + '<nav class="menu"><button class="mb" data-act="title"><span class="mt">回到标题</span></button></nav></div>'
-    + '<div class="eskip">点击继续</div>');
+    + '<div class="eskip"></div>');
+  E.eBlack = ending.querySelector('.eblack');
   E.eLine = ending.querySelector('.eline'); E.eCred = ending.querySelector('.ecred');
   E.es1 = ending.querySelector('.es1'); E.es2 = ending.querySelector('.es2'); E.eSkip = ending.querySelector('.eskip');
-  ending.addEventListener('click', (e) => { if (!e.target.closest('.mb')) advanceEnding(); });
+  ending.addEventListener('click', (e) => { if (!e.target.closest('.mb') && pressedOn(ending)) advanceEnding(); });
   wireMenu(ending);
   U.appendChild(ending);
 
@@ -1118,7 +1157,8 @@ function build() {
     + '<nav class="menu tmenu"><button class="mb" data-act="continue"><span class="mt">继续旅程</span><small></small></button>'
     + '<button class="mb" data-act="new"><span class="mt">新的旅程</span></button><button class="mb minor ht-btn" data-act="howto"><span class="mt">操作说明</span></button></nav>'
     + '<aside class="howto"><h4>操作</h4><div class="ht-list"></div></aside>'
-    + '<footer class="tfoot">按 Enter 开始 · 戴上耳机更好</footer>');
+    + '<footer class="tfoot"></footer>');
+  E.tFoot = title.querySelector('.tfoot');
   E.tCont = title.querySelector('[data-act=continue]');
   E.tNew = title.querySelector('[data-act=new]');
   E.tHow = title.querySelector('.ht-list');
@@ -1133,7 +1173,7 @@ function build() {
 function buildCraftPanel() {
   const p = E.craftp = h('div', 'panel craftp',
     '<div class="shadow"></div><div class="skin"></div><button class="x" title="关闭">' + XSVG + '</button>'
-    + '<header><h2>背包</h2><span>捡来的东西都在这里，也能用它们做点什么</span></header>'
+    + '<header><h2>背包</h2><span>捡来的东西都在这里，也能用它们做点什么</span><b class="pmsg"></b></header>'
     + '<div class="cols"><section class="bag"><div class="scroll"></div><div class="detail"></div></section>'
     + '<section class="recipes"><h3>制作</h3><div class="scroll"></div></section></div>'
     + '<footer></footer>');
@@ -1142,14 +1182,20 @@ function buildCraftPanel() {
   E.detail = p.querySelector('.detail');
   E.rList = p.querySelector('.recipes .scroll');
   E.cFoot = p.querySelector('footer');
-  p.querySelector('.x').addEventListener('click', () => closePanel());
+  E.pmsg = p.querySelector('.pmsg');
+  const x = p.querySelector('.x');
+  x.addEventListener('click', (e) => { e.stopPropagation(); if (pressedOn(x)) closePanel(); });
   p.addEventListener('click', (e) => {
     const G = API && API.G;
     if (!G) return;
+    // touch: the first tap on a cell only shows what it is (see onCell)
+    const tap = e.pointerType ? e.pointerType !== 'mouse' : S.touch;
     const cell = e.target.closest('.cell');
-    if (cell) { onCell(G, cell.dataset.id, cell); return; }
+    if (cell) { if (pressedOn(cell)) onCell(G, cell.dataset.id, tap); return; }
+    const ub = e.target.closest('.dbtn');
+    if (ub) { if (pressedOn(ub)) { useFromBag(G, ub.dataset.use); S.bagSig = ''; } ub.blur(); return; }
     const btn = e.target.closest('.rbtn');
-    if (btn && !btn.disabled) {
+    if (btn && !btn.disabled && pressedOn(btn)) {
       const id = btn.dataset.id;
       if (craft(G, id)) { S.madeId = id; S.madeT = S.t; S.detail = id; }
       S.bagSig = '';
@@ -1175,8 +1221,9 @@ function buildJournalPanel() {
   E.jCodex = p.querySelector('.page.codex');
   E.jTabs = [...p.querySelectorAll('.tab')];
   E.jCount = p.querySelector('.tab small');
-  p.querySelector('.x').addEventListener('click', () => closePanel());
-  for (const t of E.jTabs) t.addEventListener('click', () => { S.jTab = t.dataset.tab; S.jSig = ''; sfx('ui'); t.blur(); });
+  const x = p.querySelector('.x');
+  x.addEventListener('click', () => { if (pressedOn(x)) closePanel(); });
+  for (const t of E.jTabs) t.addEventListener('click', () => { if (!pressedOn(t)) return; S.jTab = t.dataset.tab; S.jSig = ''; sfx('ui'); t.blur(); });
   return p;
 }
 
@@ -1184,9 +1231,9 @@ function buildJournalPanel() {
 function wireMenu(root) {
   root.addEventListener('click', (e) => {
     const b = e.target.closest('.mb');
-    if (!b || !root.contains(b)) return;
+    if (!b || !root.contains(b) || !pressedOn(b)) return;
     b.blur();
-    menuAction(b.dataset.act, b);
+    menuAction(b.dataset.act, b, false);
   });
   root.addEventListener('pointerover', (e) => {
     const b = e.target.closest('.mb');
@@ -1214,44 +1261,87 @@ function markSel() {
   list.forEach((b, i) => toggle(b, 'sel', i === S.menuSel));
 }
 
+const TITLE_GUARD = 0.6;     // s after the title appears before its menu reacts (mashed keys from the ending)
+const CREDITS_GUARD = 2.5;   // s the end credits stay before 回到标题 reacts
+const CONFIRM_T = 4;         // s a "press again" confirmation stays armed
+
+// Is the current screen ready to take a menu activation? Guards against key / click mashing
+// that carries over from the screen before (the death fade, the end credits, a fresh title).
+function menuReady() {
+  const m = S.mode;
+  if (m === 'dead') return E.dead.classList.contains('ready');
+  if (m === 'ending') return !!(S.end && S.end.cred && S.end.ready);
+  if (m === 'title') return S.t - S.titleAt >= TITLE_GUARD;
+  return true;
+}
+
 function onKey(e) {
   const m = S.mode;
   if (m === 'ending' && !(S.end && S.end.cred)) {
-    if (['Enter', 'Space', 'KeyE', 'Escape'].includes(e.code)) advanceEnding();
+    if (['Enter', 'NumpadEnter', 'Space', 'KeyE', 'Escape'].includes(e.code) && !e.repeat) advanceEnding();
     return;
   }
   if (m !== 'title' && m !== 'pause' && m !== 'dead' && m !== 'ending') return;
-  if (m === 'dead' && !E.dead.classList.contains('ready')) return;   // still sinking: ignore mashed keys
+  if (!menuReady()) return;   // still sinking / credits still rolling / title just appeared
   const list = menuButtons();
   if (!list.length) return;
   if (e.code === 'ArrowUp' || e.code === 'KeyW') { S.menuSel = (S.menuSel - 1 + list.length) % list.length; markSel(); sfx('ui'); }
   else if (e.code === 'ArrowDown' || e.code === 'KeyS') { S.menuSel = (S.menuSel + 1) % list.length; markSel(); sfx('ui'); }
   else if ((e.code === 'Enter' || e.code === 'NumpadEnter' || e.code === 'Space') && !e.repeat) {
     const b = list[clamp(S.menuSel, 0, list.length - 1)];
-    if (b) { e.preventDefault(); menuAction(b.dataset.act, b); }
+    if (b) { e.preventDefault(); menuAction(b.dataset.act, b, e.code); }
   }
 }
 
-function menuAction(act, btn) {
+// "Press again" for anything that wipes the old journey.
+function armConfirm(btn, which) {
+  if (which === 'new') { S.confirmNewOn = true; S.confirmNew = S.t; } else { S.confirmRestartOn = true; S.confirmRestart = S.t; }
+  btn.innerHTML = '<span class="mt">再按一次：重新开始</span><small>旧的旅程会被抹去</small>';
+  btn.classList.add('warn');
+  sfx('ui');
+}
+function disarmConfirm(which) {
+  const btn = which === 'new' ? E.tNew : E.dRestart;
+  if (which === 'new') S.confirmNewOn = false; else S.confirmRestartOn = false;
+  if (!btn) return;
+  btn.innerHTML = '<span class="mt">' + (which === 'new' ? '新的旅程' : '重新开始旅程') + '</span>';
+  btn.classList.remove('warn');
+}
+
+// Why api.save() refused (see core/save.js isSafeToSave).
+function unsafeReason(G) {
+  const P = (G && G.player) || {};
+  if ((G.raft && G.raft.busy) || G.fade > 0.01) return '等这一段过去，再保存吧。';
+  if (P.underwater || P.inWater) return '在水里没法保存——回到木筏上再保存吧。';
+  if (P.hp <= 25) return '伤得太重了——包扎一下、缓一缓再保存吧。';
+  return '现在太危险了——回到木筏上再保存吧。';
+}
+function setSaveLabel(text, note) {
+  if (E.saveBtn) E.saveBtn.innerHTML = '<span class="mt">' + esc(text) + '</span>' + (note ? '<small>' + esc(note) + '</small>' : '');
+}
+
+// viaKey: the key code when activated from the keyboard (Enter / Space), else false. A Space
+// press that hands control back to the boy is swallowed so it doesn't also make him jump.
+// (Enter has no gameplay binding; swallowing it would also eat the next Space press, because
+// swallowInput() always marks Space as held.)
+function menuAction(act, btn, viaKey) {
   const G = API && API.G;
+  if (!menuReady()) return;
   try { unlockAudio(); } catch (e) { /* ignore */ }
+  const toGame = () => { if (viaKey === 'Space') swallowInput(); };
   switch (act) {
-    case 'continue': sfx('ui'); API.continueGame(); break;
+    case 'continue': sfx('ui'); API.continueGame(); toGame(); break;
     case 'new':
-      if (API.hasSave() && S.t - S.confirmNew > 4) {
-        S.confirmNew = S.t;
-        btn.innerHTML = '<span class="mt">再按一次：重新开始</span><small>旧的旅程会被抹去</small>';
-        btn.classList.add('warn');
-        sfx('ui');
-        return;
-      }
-      sfx('ui'); API.startNew(); break;
+      if (API.hasSave() && !S.confirmNewOn) { armConfirm(btn, 'new'); return; }
+      S.confirmNewOn = false;
+      sfx('ui'); API.startNew(); toGame(); break;
     case 'howto': E.title.classList.toggle('showkeys'); sfx('ui'); break;
-    case 'resume': if (G) { G.mode = 'play'; } sfx('ui'); break;
+    case 'resume': if (G) { G.mode = 'play'; } sfx('ui'); toGame(); break;
     case 'save': {
-      const ok = API.save();
-      setText(btn.querySelector('.mt'), ok ? '已保存' : '保存失败');
-      S.saveFlashT = S.t;
+      const ok = !!API.save();
+      if (ok) setSaveLabel('已保存');
+      else setSaveLabel('现在不能保存', G && !isSafeToSave(G) ? unsafeReason(G) : '没能写进存档（浏览器不让保存）。');
+      S.saveFlashT = S.t; S.saveFlashDur = ok ? 2 : 4.5;
       sfx('ui');
       break;
     }
@@ -1264,9 +1354,12 @@ function menuAction(act, btn) {
       if (!m) sfx('ui');
       break;
     }
-    case 'title': sfx('ui'); API.toTitle(); break;
-    case 'restart': sfx('ui'); API.restart(); break;
-    case 'load': sfx('ui'); API.continueGame(); break;
+    case 'title': sfx('ui'); API.toTitle(); toGame(); break;
+    case 'restart':
+      if (API.hasSave() && !S.confirmRestartOn) { armConfirm(btn, 'restart'); return; }
+      S.confirmRestartOn = false;
+      sfx('ui'); API.restart(); toGame(); break;
+    case 'load': sfx('ui'); API.continueGame(); toGame(); break;
   }
 }
 
@@ -1301,6 +1394,7 @@ export function initUI(api) {
   window.addEventListener('keydown', unlock, true);
   window.addEventListener('touchend', unlock, true);
   window.addEventListener('keydown', onKey);
+  window.addEventListener('pointerdown', (e) => { S.downEl = e.target; }, true);
   // the UI keeps the mute choice itself (remembered across sessions) and tells audio.js
   let saved = null;
   try { saved = localStorage.getItem(MUTE_KEY); } catch (e) { saved = null; }
@@ -1358,6 +1452,9 @@ export function frame(G, dt) {
     toggle(U, 'tmode', tm);
     if (E.pkeys) E.pkeys.innerHTML = keysHTML(tm);
     if (E.tHow) E.tHow.innerHTML = keysHTML(tm);
+    setText(E.tFoot, hk('按 Enter 开始 · 戴上耳机更好', '戴上耳机更好'));
+    setText(E.eSkip, hk('点击或按 Enter 继续', '点一下继续'));
+    S.bagSig = '';   // the bag texts name controls
   }
 
   handleToggles(G);
@@ -1367,7 +1464,11 @@ export function frame(G, dt) {
   updateToasts(G, dt);
   updatePrompt(G);
   if (m === 'panel') updatePanel(G);
-  if (m === 'pause' && S.saveFlashT && S.t - S.saveFlashT > 2) { S.saveFlashT = 0; setText(E.saveBtn.querySelector('.mt'), '保存'); }
+  if (S.pmsgT && (m !== 'panel' || S.t - S.pmsgT > 3.6)) { S.pmsgT = 0; toggle(E.pmsg, 'on', false); }
+  if (m === 'pause' && S.saveFlashT && S.t - S.saveFlashT > (S.saveFlashDur || 2)) { S.saveFlashT = 0; setSaveLabel('保存'); }
+  // a "press again" confirmation that was not confirmed in time goes back to normal
+  if (S.confirmNewOn && (m !== 'title' || S.t - S.confirmNew > CONFIRM_T)) disarmConfirm('new');
+  if (S.confirmRestartOn && (m !== 'dead' || S.t - S.confirmRestart > CONFIRM_T)) disarmConfirm('restart');
   if (m === 'ending') updateEnding(G, dt);
   if (m === 'dead' && S.deadAt != null && S.t - S.deadAt > 3.9) toggle(E.dead, 'ready', true);
   updateCine(G, dt);
@@ -1384,6 +1485,8 @@ function attach(G) {
   S.day = null; S.dist = null; S.trackP = null; S.dialA = null; S.slotKey = ''; S.chipKey = '';
   S.tool = G.player ? G.player.tool : null; S.toolHintT = 0;
   S.lastHp = null; S.hurt = 0; S.playT = 0; S.bagSig = ''; S.jSig = ''; S.detail = null;
+  S.matBase = null; S.hookFloatT = 0; S.pmsgT = 0;
+  if (E.pmsg) toggle(E.pmsg, 'on', false);
   S.lastDay = G.day; S.dayCard = null;
   S.intro = null; S.cont = null; S.end = null;
   S.modeKey = '';
@@ -1416,7 +1519,7 @@ function handleToggles(G) {
     else if (input.journalPressed) openPanel(G, 'journal');
   } else if (m === 'panel') {
     if (input.pausePressed) closePanel();
-    else if (input.craftPressed) { if (G.panel === 'craft') closePanel(); else { G.panel = 'craft'; sfx('ui'); } }
+    else if (input.craftPressed) { if (G.panel === 'craft') closePanel(); else { G.panel = 'craft'; flags(G).ui_bag = 1; sfx('ui'); } }
     else if (input.journalPressed) { if (G.panel === 'journal') closePanel(); else { G.panel = 'journal'; sfx('ui'); } }
   } else if (m === 'pause') {
     if (input.pausePressed) G.mode = 'play';
@@ -1427,6 +1530,7 @@ function handleToggles(G) {
 function openPanel(G, which) {
   if (G.player && (G.player.dead || G.player.hp <= 0)) return;
   G.mode = 'panel'; G.panel = which;
+  if (which === 'craft' && !G.demo) flags(G).ui_bag = 1;
   sfx('ui');
 }
 function closePanel() {
@@ -1458,9 +1562,8 @@ function enterTitle() {
   let has = false;
   try { has = !!API.hasSave(); } catch (e) { has = false; }
   E.tCont.hidden = !has;
-  E.tNew.innerHTML = '<span class="mt">新的旅程</span>';
-  E.tNew.classList.remove('warn');
-  S.confirmNew = -99;
+  disarmConfirm('new');
+  S.titleAt = S.t;
   let info = '';
   if (has) {
     try {
@@ -1474,7 +1577,7 @@ function enterTitle() {
 
 function enterPause(G) {
   setText(E.pinfo, '第 ' + G.day + ' 天 · 距灯塔 ' + fmtDist(G) + ' 海里 · 图鉴 ' + codexFound(G) + ' / ' + CODEX_IDS.length);
-  setText(E.saveBtn.querySelector('.mt'), '保存');
+  setSaveLabel('保存'); S.saveFlashT = 0;
   refreshMute();
 }
 
@@ -1506,14 +1609,14 @@ function bestFood(G) {
 }
 
 const TOOL_HINT = {
-  hook: '按住蓄力，松开抛出钩索；钩住了再按住，拉回来',
-  spear: '点一下刺出去。水下也能用，鲨鱼挨三下就会跑',
+  hook: '按住左键蓄力，松开抛出钩索；钩住了再按住，拉回来',
+  spear: '点左键刺出去。水下也能用，鲨鱼挨三下就会跑',
   hammer: '建造：Q / 滚轮 换部件，左键放下；也能修补木筏',
   hand: '空着手。有提灯的话，夜里它会自己亮起来',
 };
 const TOOL_HINT_TOUCH = {
   hook: '按住「使用」蓄力，松开抛出钩索；再按住拉回来',
-  spear: '点「使用」刺出去。水下也能用',
+  spear: '点「使用」刺出去。水下也能用，鲨鱼挨三下就会跑',
   hammer: '建造：「切换」换部件，「使用」放下',
   hand: '空着手。有提灯的话，夜里它会自己亮起来',
 };
@@ -1563,7 +1666,7 @@ function updateHud(G, dt) {
   if (tool !== S.tool) {
     if (S.tool != null && tool) {
       const name = (E.slots.find((s) => s.id === tool) || {}).name || '';
-      E.thint.innerHTML = '<b>' + esc(name) + '</b>' + esc((S.touch ? TOOL_HINT_TOUCH : TOOL_HINT)[tool] || '');
+      E.thint.innerHTML = '<b>' + esc(name) + '</b>' + esc(hk(TOOL_HINT[tool] || '', TOOL_HINT_TOUCH[tool] || ''));
       S.toolHintT = 3.8;
     }
     S.tool = tool;
@@ -1577,7 +1680,7 @@ function updateHud(G, dt) {
   for (const id of ['cooked_fish', 'can', 'coconut', 'berry', 'raw_fish']) nFood += count(G, id);
   const drink = count(G, 'water') > 0 ? 'water' : count(G, 'coconut') > 0 ? 'coconut' : null;
   const nDrink = count(G, 'water') + count(G, 'coconut');
-  const ck = food + nFood + '|' + drink + nDrink;
+  const ck = food + nFood + '|' + drink + nDrink + '|' + S.touch;
   if (ck !== S.chipKey) {
     S.chipKey = ck;
     const ei = E.eat.querySelector('img'), di = E.drink.querySelector('img');
@@ -1587,8 +1690,8 @@ function updateHud(G, dt) {
     setText(E.eat.querySelector('.cn'), '×' + nFood);
     setText(E.drink.querySelector('.cn'), '×' + nDrink);
     toggle(E.eat, 'none', !nFood); toggle(E.drink, 'none', !nDrink);
-    E.eat.title = food ? '吃' + itemName(food) + '（F）' : '没有吃的了';
-    E.drink.title = drink ? '喝' + itemName(drink) + '（R）' : '没有淡水了';
+    E.eat.title = food ? hk('吃' + itemName(food) + '（F）', '吃' + itemName(food)) : '没有吃的了';
+    E.drink.title = drink ? hk('喝' + itemName(drink) + '（R）', '喝' + itemName(drink)) : '没有淡水了';
   }
 }
 
@@ -1651,6 +1754,12 @@ function updateToasts(G, dt) {
         rec = { el, text: t.text, dead: false };
         S.toasts.set(t, rec);
         requestAnimationFrame(() => el.classList.add('on'));
+        if (G.mode === 'panel' && !t.pick && E.pmsg) {
+          setText(E.pmsg, String(t.text || ''));
+          toggle(E.pmsg, 'warn', t.kind === 'warn');
+          toggle(E.pmsg, 'on', true);
+          S.pmsgT = S.t;
+        }
       } else if (rec.text !== t.text) {
         rec.text = t.text;
         rec.el.innerHTML = toastHTML(t);
@@ -1735,7 +1844,7 @@ function renderBag(G) {
   for (const cat of ['food', 'material', 'tool', 'placeable', 'story']) {
     const list = groups[cat];
     if (!list) continue;
-    html += '<h3>' + CATEGORY_NAMES[cat] + (cat === 'food' ? '<em>点击使用</em>' : cat === 'placeable' ? '<em>用锤子装到木筏上</em>' : '') + '</h3><div class="grid">';
+    html += '<h3>' + CATEGORY_NAMES[cat] + (cat === 'food' ? '<em>' + hk('点击使用', '点两下使用') + '</em>' : cat === 'placeable' ? '<em>用锤子装到木筏上</em>' : '') + '</h3><div class="grid">';
     for (const [id, n] of list) {
       const use = ITEMS[id].use ? ' use' : '';
       const cur = S.detail === id ? ' cur' : '';
@@ -1748,7 +1857,8 @@ function renderBag(G) {
   const top = E.bagList.scrollTop;
   E.bagList.innerHTML = html;
   E.bagList.scrollTop = top;
-  E.cFoot.innerHTML = S.touch ? '点空白处关闭 · 点食物吃掉 · 做好的东西用锤子装到木筏上' : '<kbd>Tab</kbd> 关闭　<kbd>J</kbd> 日记　点击食物吃掉　做好的设施拿锤子（3）装到木筏上';
+  E.cFoot.innerHTML = hk('<kbd>Tab</kbd> 关闭　<kbd>J</kbd> 日记　点击食物吃掉　做好的设施拿锤子（<kbd>3</kbd>）装到木筏上',
+    '点空白处关闭 · 点一下看看是什么，再点一下吃掉 · 做好的设施用锤子装到木筏上');
 }
 
 function effText(u) {
@@ -1759,17 +1869,21 @@ function effText(u) {
   return p.join('　');
 }
 
+const useVerb = (id) => (id === 'water' ? '喝' : id === 'bandage' ? '用' : id === 'note' ? '读' : '吃');
+
 function renderDetail(G) {
   if (!G) return;
   const id = S.detail;
   for (const c of E.bagList.querySelectorAll('.cell')) toggle(c, 'cur', c.dataset.id === id);
   const it = id && ITEMS[id];
-  if (!it) { E.detail.innerHTML = '<p>' + (S.touch ? '点一下东西，看看它是什么。' : '把指针移到东西上看看。') + '</p>'; return; }
+  if (!it) { E.detail.innerHTML = '<p>' + hk('把指针移到东西上看看。', '点一下东西，看看它是什么。') + '</p>'; return; }
   const catName = (CATEGORY_NAMES[it.cat] || '').replace(' · 药品', '');
+  const n = count(G, id);
   let extra = '';
   if (it.use) extra = '<span class="eff">' + effText(it.use) + '</span>　';
   if (id === 'raw_fish') extra = '<span class="eff">饱食 +12</span>　';
-  E.detail.innerHTML = '<img alt="" src="' + iconURL(id) + '"><div><b>' + esc(it.name) + '<small>' + esc(catName) + (count(G, id) ? ' · 有 ' + count(G, id) : '') + '</small></b><p>' + extra + esc(it.desc || '') + '</p></div>';
+  const btn = (it.use || id === 'note') && n > 0 ? '<button class="dbtn" data-use="' + id + '">' + useVerb(id) + '</button>' : '';
+  E.detail.innerHTML = '<img alt="" src="' + iconURL(id) + '"><div><b>' + esc(it.name) + '<small>' + esc(catName) + (n ? ' · 有 ' + n : '') + '</small></b><p>' + extra + esc(it.desc || '') + '</p></div>' + btn;
 }
 
 function renderRecipes(G) {
@@ -1791,25 +1905,30 @@ function renderRecipes(G) {
       + '<div class="rmid"><div class="rname">' + esc(r.name) + '<small>' + kind + (count(G, id) ? ' · 有 ' + count(G, id) : '') + '</small></div>'
       + '<div class="rdesc">' + esc(r.desc) + '</div><div class="cost">' + cost + '</div></div>' + btn + '</div>';
   }
-  html += '<p class="rnote">扩建木筏不在这里：拿起锤子（3），在木筏两头放下新木板，每块要 木板×2、绳子×1。</p>';
+  html += '<p class="rnote">扩建木筏不在这里：' + hk('拿起锤子（按 3）', '拿起锤子（点工具栏第 3 格）') + '，在木筏两头放下新木板，每块要 木板×2、绳子×1。</p>';
   const top = E.rList.scrollTop;
   E.rList.innerHTML = html;
   E.rList.scrollTop = top;
 }
 
-function onCell(G, id, cell) {
-  S.detail = id;
+// Mouse: a click uses food at once (hovering already showed what it is). Touch: the first
+// tap selects and shows the details with a 吃 / 喝 / 用 button; a second tap (or the button) uses it.
+function onCell(G, id, tap) {
   const it = ITEMS[id];
-  if (it && it.use) {
-    const ok = useItem(G, id);
-    if (ok) { S.usedId = id; S.usedT = S.t; }
-    else sfx('ui');
-  } else if (id === 'note') {
-    S.jTab = 'diary';
-    G.panel = 'journal';
-    sfx('ui');
-  } else sfx('ui');
+  const usable = !!(it && it.use) || id === 'note';
+  if (usable && tap && S.detail !== id) { S.detail = id; sfx('ui'); S.bagSig = ''; return; }
+  S.detail = id;
+  if (usable) useFromBag(G, id);
+  else sfx('ui');
   S.bagSig = '';
+}
+
+function useFromBag(G, id) {
+  if (!id || count(G, id) <= 0) { sfx('ui'); return; }
+  if (id === 'note') { S.jTab = 'diary'; G.panel = 'journal'; sfx('ui'); return; }
+  const ok = useItem(G, id);
+  if (ok) { S.usedId = id; S.usedT = S.t; }
+  else sfx('ui');
 }
 
 // =====================================================================================
@@ -1888,9 +2007,13 @@ function renderCodex(G) {
 // death
 // =====================================================================================
 
+const SEA_DEATHS = ['drown', 'shark', 'jelly', 'angler'];
 function enterDead(G) {
   const cause = G.deathCause || '';
-  setText(E.dTitle, cause === 'beast' ? '黑暗吞没了你……' : '你沉入了海里……');
+  const sea = SEA_DEATHS.includes(cause);
+  setText(E.dTitle, sea ? '你沉入了海里……' : cause === 'beast' ? '黑暗吞没了你……' : '你倒在了木筏上……');
+  toggle(E.dead, 'dry', !sea);
+  disarmConfirm('restart');
   const last = Array.isArray(G.journal) && G.journal.length ? G.journal[G.journal.length - 1] : null;
   setText(E.dLine, last && last.text ? last.text : '少年的旅程，在这片海上结束了。');
   setText(E.dStat, '在海上漂了 ' + G.day + ' 天 · 离灯塔还有 ' + fmtDist(G) + ' 海里 · 图鉴 ' + codexFound(G) + ' / ' + CODEX_IDS.length);
@@ -1927,12 +2050,23 @@ function endingLines(G) {
   return L;
 }
 
+// The ending plays over the live world: the screen dips to black as the door opens, comes
+// back at dusk on the lighthouse island, and the evening slowly turns to night while the
+// lamp wakes up and its beam starts to turn. Only the words are DOM.
+const END_BLACK = 1.5;        // s of black before the world comes back (at dusk)
+const END_PHASE = 0.585;      // just after sunset: the lamp is warming up
+const END_RATE = 1.35;        // the evening passes a little faster than real time…
+const END_NIGHT = 0.8;        // …until deep night, then at real time
+
 function enterEnding(G) {
-  S.end = { t: 0, i: -1, lineT: 0, lines: endingLines(G), cred: false, fadeT: 0 };
+  S.end = { t: 0, i: -1, lineT: 0, lines: endingLines(G), cred: false, ready: false, credT: 0, jumped: false, time: null };
   setText(E.es1, '第 ' + G.day + ' 天，少年抵达了灯塔。');
   setText(E.es2, '图鉴 ' + codexFound(G) + ' / ' + CODEX_IDS.length + ' · 找到的信 ' + lettersFound(G) + ' / 8');
   toggle(E.eCred, 'on', false);
   toggle(E.eLine, 'on', false);
+  toggle(E.ending, 'cred', false);
+  toggle(E.ending, 'ready', false);
+  toggle(E.eBlack, 'off', false);
   E.eSkip.hidden = false;
   S.intro = null; S.cont = null;
   sfx('discover');
@@ -1940,12 +2074,41 @@ function enterEnding(G) {
 
 function lineDur(text) { return 3.2 + String(text).length * 0.085; }
 
+// The world does not step while G.mode is 'ending', so the clock is driven from here:
+// sky, sea, lighting and the lighthouse beam all draw from G.time / G.phase.
+function endingClock(G, dt) {
+  const st = S.end;
+  if (!st.jumped) {
+    if (st.t < END_BLACK) return;
+    st.jumped = true;
+    const p = G.phase || 0;
+    if (p < END_PHASE) G.time += (END_PHASE - p) * C.DAY_LEN;
+    else if (p >= C.NIGHT_END) G.time += (1 + END_PHASE - p) * C.DAY_LEN;
+    st.time = G.time;
+    // a clear evening for the last scene
+    try { if (G.weather && G.weather.kind !== 'clear' && G.weather.kind !== 'cloudy') debugWeather(G, 'clear'); } catch (e) { /* ignore */ }
+    toggle(E.eBlack, 'off', true);
+  } else {
+    st.time += dt * (G.phase < END_NIGHT && G.phase >= 0.5 ? END_RATE : 1);
+  }
+  G.time = st.time;
+  syncTime(G);
+}
+
 function updateEnding(G, dt) {
   const st = S.end;
   if (!st) return;
   st.t += dt;
-  if (st.cred) return;
-  if (st.t < 3.2) return;                 // the screen fades to night first
+  endingClock(G, dt);
+  if (st.cred) {
+    if (!st.ready && st.t - st.credT >= CREDITS_GUARD) {
+      st.ready = true;
+      toggle(E.ending, 'ready', true);
+      S.menuSel = 0; markSel();
+    }
+    return;
+  }
+  if (st.t < 3.4) return;                 // the dip to black, then the evening comes back
   if (st.i < 0) { showEndingLine(0); return; }
   st.lineT += dt;
   const cur = st.lines[st.i];
@@ -1961,12 +2124,12 @@ function showEndingLine(i) {
   const st = S.end;
   if (!st) return;
   if (i >= st.lines.length) {
-    st.cred = true;
+    st.cred = true; st.credT = st.t; st.ready = false;
     toggle(E.eLine, 'on', false);
     toggle(E.eCred, 'on', true);
+    toggle(E.ending, 'cred', true);
     E.eSkip.hidden = true;
     S.menuSel = 0;
-    setTimeout(markSel, 50);
     return;
   }
   st.i = i; st.lineT = 0; st.fading = false;
@@ -1977,7 +2140,7 @@ function showEndingLine(i) {
 function advanceEnding() {
   const st = S.end;
   if (!st || st.cred) return;
-  if (st.t < 3.2) { st.t = 3.2; return; }
+  if (st.t < 3.4) { st.t = 3.4; return; }
   showEndingLine(st.i + 1);
 }
 
@@ -2009,26 +2172,35 @@ function startContinue(G) {
   S.cont = { t: 0 };
   E.cineLines.innerHTML = '<p>第 ' + G.day + ' 天</p><p class="sm">旅程继续 · 距灯塔 ' + esc(fmtDist(G)) + ' 海里</p>';
   toggle(E.cine, 'on', true);
+  toggle(E.hud, 'cine', true);      // the letterbox bars would cut through the gauges
   E.wake.style.opacity = '1';
   requestAnimationFrame(() => E.cineLines.querySelectorAll('p').forEach((p) => p.classList.add('on')));
 }
 
 function updateCine(G, dt) {
   const ps = () => E.cineLines.querySelectorAll('p');
+  const playing = G.mode === 'play' || G.mode === 'panel' || G.mode === 'pause';
+  // the cinematic clocks stand still while the game is paused or a panel is open
+  if (G.mode === 'pause' || G.mode === 'panel') dt = 0;
+  if ((S.intro || S.cont) && !playing) {
+    S.intro = null; S.cont = null;
+    toggle(E.cine, 'on', false); toggle(E.hud, 'cine', false); E.wake.style.opacity = '0'; E.cineLines.innerHTML = '';
+  }
   if (S.intro) {
     const I = S.intro;
     I.t += dt;
     E.wake.style.opacity = String(clamp(1 - (I.t - 1.5) / 3.5, 0, 1).toFixed(3));
     const list = ps();
     for (let k = 0; k < INTRO.length; k++) if (I.t >= INTRO[k][0] && list[k] && !list[k].classList.contains('on')) list[k].classList.add('on');
-    if (I.t > 11.5 && !I.out) { I.out = true; toggle(E.cine, 'on', false); toggle(E.hud, 'cine', false); }
+    if (I.t > 11.5 && !I.out) { I.out = true; toggle(E.cine, 'on', false); }
+    if (I.t > 12.4) toggle(E.hud, 'cine', false);      // once the letterbox bars have slid away
     if (I.t > 13) { S.intro = null; E.cineLines.innerHTML = ''; E.wake.style.opacity = '0'; }
-    if (G.mode !== 'play' && G.mode !== 'panel' && G.mode !== 'pause') { S.intro = null; toggle(E.cine, 'on', false); toggle(E.hud, 'cine', false); E.wake.style.opacity = '0'; }
   } else if (S.cont) {
     const K = S.cont;
     K.t += dt;
     E.wake.style.opacity = String(clamp(1 - K.t / 1.6, 0, 1).toFixed(3));
     if (K.t > 3.4 && !K.out) { K.out = true; toggle(E.cine, 'on', false); }
+    if (K.t > 4.3) toggle(E.hud, 'cine', false);      // once the letterbox bars have slid away
     if (K.t > 5) { S.cont = null; E.cineLines.innerHTML = ''; E.wake.style.opacity = '0'; }
   }
 
@@ -2053,6 +2225,20 @@ function updateCine(G, dt) {
 // story beats
 // =====================================================================================
 
+const MATS = ['wood', 'plastic', 'rope', 'cloth', 'metal', 'leaf'];
+// Remember what the player has already figured out, so the tutorial doesn't explain it again.
+function tutorialWatch(G, F) {
+  const h = G.hook;
+  if (h) F.ui_thrown = 1;
+  if (h && h.caught > 0) F.ui_caught = 1;
+  S.hookFloatT = h && h.state === 'floating' ? S.hookFloatT + G.dt : 0;
+  let mats = 0;
+  for (const id of MATS) mats += count(G, id);
+  if (S.matBase == null) S.matBase = mats;
+  else if (mats > S.matBase) F.ui_caught = 1;     // something came aboard (hook, island, chest…)
+  else if (mats < S.matBase) S.matBase = mats;    // spent on building: keep the lower mark
+}
+
 function story(G) {
   if (G.demo) return;
   const F = flags(G);
@@ -2073,17 +2259,19 @@ function story(G) {
     }
   }
 
-  // first-time tutorial nudges (new journeys only, after the intro)
-  if (S.intro) return;
-  const touch = S.touch;
-  if (!F.ui_tut1 && S.playT > 3 && G.day === 1) {
+  // first-time tutorial nudges (day 1, after the intro). Each one is skipped once the
+  // player has already done what it explains.
+  tutorialWatch(G, F);
+  if (S.intro || G.day !== 1) return;
+  if (!F.ui_tut1 && S.playT > 3) {
     F.ui_tut1 = 1;
-    say(G, touch ? '按住「使用」蓄力，松开把钩索抛向海上漂着的东西。' : '按住鼠标左键蓄力，松开把钩索抛向海上漂着的东西。');
-  } else if (F.ui_tut1 && !F.ui_tut2 && S.playT > 16 && G.day === 1) {
+    if (!F.ui_thrown) say(G, hk('按住鼠标左键蓄力，松开把钩索抛向海上漂着的东西。', '按住「使用」蓄力，松开把钩索抛向海上漂着的东西。'));
+  } else if (F.ui_tut1 && !F.ui_tut2 && (S.hookFloatT > 2.5 || S.playT > 24)) {
     F.ui_tut2 = 1;
-    say(G, touch ? '钩住以后再按住「使用」，把东西拉回来。' : '钩住以后再按住左键，把东西拉回来。');
+    if (!F.ui_caught) say(G, hk('钩住东西以后，再按住左键把它拉回来。', '钩住东西以后，再按住「使用」把它拉回来。'));
   } else if (F.ui_tut2 && !F.ui_tut3 && S.playT > 45) {
     F.ui_tut3 = 1;
-    say(G, touch ? '点「背包」看看捡到了什么，还能做工具。' : '按 Tab 打开背包，用捡来的东西做工具。');
+    const crafted = Object.keys(F).some((k) => k.startsWith('made_'));
+    if (!F.ui_bag && !crafted) say(G, hk('按 Tab 打开背包，用捡来的东西做工具。', '点「背包」看看捡到了什么，还能做工具。'));
   }
 }
