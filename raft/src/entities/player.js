@@ -4,7 +4,7 @@
 //   eight directions, climb back onto the raft, walk up island beaches), oxygen and the
 //   survival stats, death, picking the interactable under the prompt, tools (hook + rope,
 //   spear, hammer swing, bare hands), eating and drinking, his own small light and the
-//   lantern.
+//   lantern. While a raft cutscene runs (G.raft.busy) he ignores movement and tool input.
 // draw(ctx, G): a procedurally animated little boy — big head, messy dark hair, an
 //   oversized navy knit sweater with rolled sleeves, shorts, bare feet and a long red
 //   scarf (a verlet ribbon that flutters in the wind and floats under water). He is drawn
@@ -16,12 +16,12 @@
 // depth, invuln, dead, charge, lantern.
 
 import { C, isNight, say, journal } from '../core/state.js';
-import { input } from '../core/input.js';
+import { input, hint } from '../core/input.js';
 import { waterY, seabedY, groundAt, addLight, addInteract, addHit, onScreen, worldToScreen } from '../core/world.js';
 import { emit } from '../core/particles.js';
 import { TAU, clamp, lerp, smoothstep, approach, noise1, rand, makeCanvas } from '../core/util.js';
 import { deckAt } from '../systems/raft.js';
-import { islandAt } from '../systems/islands.js';
+import { islandAt, groundAt as isleGroundAt } from '../systems/islands.js';
 import { hookCatch, collectAttached } from './debris.js';
 import { useItem } from '../systems/inventory.js';
 import { sfx } from '../systems/audio.js';
@@ -37,12 +37,16 @@ const WALK = 70;
 const ACC_GROUND = 640, FRICTION = 900, ACC_AIR = 430;
 const JUMP_V = Math.sqrt(2 * C.GRAVITY * 40);    // ≈ 40 units high
 const STEP_UP = 9;             // ledges up to this height are walked up
+const STEP_RAFT = STEP_UP + 7; // from a beach onto a beached raft whose deck end a wave has lifted
 const WADE_MAX = 17;           // feet deeper than this under the surface → swimming
 const SWIM_SURF = 48, SWIM_DEEP = 64, FLIPPERS = 1.4;
 const O2_DRAIN = 100 / 22, O2_FILL = 100 / 2.2, DROWN_DPS = 6;
 const HUNGER_RATE = 100 / 360, THIRST_RATE = 100 / 240;
 const HOOK_G = 560, ROPE_MAX = 280, REEL_SPEED = 200, CHARGE_TIME = 0.8;
-const SPEAR_CD = 0.45, SPEAR_CD_WATER = 0.62, SPEAR_REACH = 26;
+const SPEAR_CD = 0.45, SPEAR_CD_WATER = 0.62, SPEAR_REACH = 34, SPEAR_R = 14;   // reach ≈ the drawn tip at full thrust
+const SWIM_IDLE_RISE = 3;      // idle under water he drifts up this slowly (≈ holding still, so fish don't startle)
+const HP_REGEN = 0.25;         // hp/s while fed and watered (slow: bandages should matter)
+const CLIMB_SLACK = 3;         // the raft can be climbed from within this many units inside either end, never from beneath
 const RAFT_UNDER = 12;         // deck top → underside of the logs
 const FOODS = ['cooked_fish', 'can', 'coconut', 'berry', 'raw_fish'];
 const TOOLS = ['hook', 'spear', 'hammer', 'hand'];
@@ -104,6 +108,20 @@ function ground(G, x, fromY) {
 }
 // The highest solid surface at x (raft deck, island, seabed) wherever the boy is.
 const topAt = (G, x) => ground(G, x, -1e9);
+// Island terrain height at x (incl. its underwater slopes), or null.
+function isleY(G, x) {
+  try { const y = isleGroundAt(G, x); return Number.isFinite(y) ? y : null; } catch (e) { oops('islands.groundAt', e); return null; }
+}
+// The floor at x WITHOUT the raft (island terrain or seabed): the highest one at or below fromY - 2.
+function floorAt(G, x, fromY = -1e9) {
+  let best = null;
+  const i = isleY(G, x);
+  if (i != null && i >= fromY - 2) best = { y: i, kind: 'island' };
+  let s = null;
+  try { s = seabedY(G, x); } catch (e) { oops('seabedY', e); }
+  if (Number.isFinite(s) && s >= fromY - 2 && (!best || s < best.y)) best = { y: s, kind: 'seabed' };
+  return best;
+}
 // Where a thrown hook comes to rest at x: dry land / deck, or the water surface.
 function surfaceTop(G, x) {
   const wy = waterY(G, x);
@@ -133,7 +151,7 @@ function newRt(G) {
     invuln: 0, hurtT: 9, hurtDir: 1, coyote: 0, jumpBuf: 0, landT: 9, landPow: 0,
     walkPh: 0, swimPh: 0, underT: 0, bubbleT: 0.8, glowT: 0, wetT: 0, wadeT: 0,
     charging: false, charge: 0, throwT: 9, swingT: 9, eatT: 9, spear: null, spearCD: 0, reelT: 0,
-    climb: null,
+    climb: null, airCarry: 0, frozen: false,
     warn: { o2: false, far: false, hunger: false, thirst: false, nohook: false },
     lantern: false, cause: '', dead: false, deadT: 0, deadWater: false, deadRot: 0, sink: 0,
     starve: '',
@@ -147,6 +165,10 @@ function newRt(G) {
   };
 }
 const rt = (G) => G.playerRt || (G.playerRt = newRt(G));
+
+// The held controls as the boy obeys them this step. While a raft cutscene runs
+// (G.raft.busy: sailing around an island, sleeping) he ignores movement and tool input.
+const ctl = { up: false, down: false, use: false };
 
 // =====================================================================================
 // init
@@ -187,8 +209,13 @@ export function update(G, dt) {
   R.invuln = Math.max(0, R.invuln - dt);
   R.hurtT += dt; R.landT += dt; R.throwT += dt; R.swingT += dt; R.eatT += dt;
   R.spearCD = Math.max(0, R.spearCD - dt);
+  R.frozen = !!(G.raft && G.raft.busy);
+  ctl.up = !R.frozen && input.up;
+  ctl.down = !R.frozen && input.down;
+  ctl.use = !R.frozen && input.use;
   R.jumpBuf = Math.max(0, R.jumpBuf - dt);
-  if (input.jumpPressed) R.jumpBuf = 0.13;
+  if (R.frozen) R.jumpBuf = 0;
+  else if (input.jumpPressed) R.jumpBuf = 0.13;
 
   // the raft has not reported its deck yet (first frame of a session): hold still
   const span = raftSpan(G);
@@ -202,11 +229,11 @@ export function update(G, dt) {
   if (R.fresh || Math.abs(P.x - R.lastX) > 40 || Math.abs(P.y - R.lastY) > 40) classify(G, P, R);
   R.fresh = false;
 
-  if (input.toolPressed) selectTool(G, P, R, input.toolPressed);
+  if (input.toolPressed && !R.frozen) selectTool(G, P, R, input.toolPressed);
   if (P.tool === 'spear' && !(has(G, 'spear') > 0)) P.tool = 'hand';
 
   // ---- movement
-  const dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  const dir = R.frozen ? 0 : (input.right ? 1 : 0) - (input.left ? 1 : 0);
   const busy = R.charging || (G.hook && G.hook.state === 'reeling' && !G.hook.fast) || (R.spear && R.mode !== 'swim');
   const mul = (busy ? 0.55 : 1) * (tired(P) ? 0.82 : 1);
   if (dir && R.mode !== 'climb' && !R.charging && !(R.spear && R.spear.t < R.spear.dur)) P.facing = dir;
@@ -217,7 +244,7 @@ export function update(G, dt) {
   else if (R.mode === 'swim') stepSwim(G, P, R, dt, dir, mul);
   else if (R.mode === 'climb') stepClimb(G, P, R, dt);
   if (!Number.isFinite(P.x) || !Number.isFinite(P.y)) { P.x = R.lastX; P.y = R.lastY; P.vx = P.vy = 0; }
-  unstick(G, P, R);
+  unstick(G, P, R, dt);
 
   // ---- head, depth, oxygen
   const wy = waterY(G, P.x);
@@ -236,12 +263,13 @@ export function update(G, dt) {
 
   // ---- tools, items, interaction
   if (R.mode !== 'climb') {
-    hookInput(G, P, R, dt);
-    spearAndHammer(G, P, R, dt);
-    eatDrink(G, P, R);
+    const act = !R.frozen;
+    if (act) hookInput(G, P, R, dt); else R.charging = false;
+    spearAndHammer(G, P, R, dt, act);
+    if (act) eatDrink(G, P, R);
   } else R.charging = false;
   updateHook(G, P, R, dt);
-  pickInteractable(G, P, R);
+  if (!R.frozen) pickInteractable(G, P, R);
 
   // ---- light, little effects, warnings
   lights(G, P, R);
@@ -282,18 +310,33 @@ function extents(rot) {
   return { up: Math.max(19 * c, -9.5 * c) + 3.5 * s, down: Math.max(9.5 * c, -19 * c) + 3.5 * s };
 }
 
-// Never end a step inside island terrain (a solid column from its surface down).
-function unstick(G, P, R) {
+// Never end a step inside island terrain (a solid column from its surface down) — also when
+// a beached raft's deck lies above that sand and is the highest surface there.
+function unstick(G, P, R, dt) {
   if (R.mode === 'climb') return;
-  const top = topAt(G, P.x);
-  if (!top || top.kind !== 'island' || P.y - PELVIS * 0.6 <= top.y) return;
-  P.y = top.y;
+  const iy = isleY(G, P.x);
+  if (iy == null || P.y - PELVIS * 0.6 <= iy) return;
+  const d = deck(G, P.x);
+  if (d != null && d < iy) {
+    // under the logs: rest on the sand, and if the body doesn't fit there, back out to open water
+    const span = raftSpan(G);
+    const ex = extents(R.mode === 'swim' ? R.rot : 0);
+    const lim = R.mode === 'swim' ? iy + PELVIS - ex.down : iy;
+    if (P.y <= lim + 0.5) return;
+    P.y = lim;
+    if (P.vy > 0) P.vy = 0;
+    const c = raftCeil(G, span, P.x, ex);
+    if (span && c != null && c > lim) escapeRaft(G, P, span, dt);
+    return;
+  }
+  P.y = iy;
   if (P.vy > 0) P.vy = 0;
-  if (top.y - waterY(G, P.x) < WADE_MAX) { R.mode = 'ground'; R.gk = 'island'; R.under = false; R.rot = 0; }
+  if (iy - waterY(G, P.x) < WADE_MAX) { R.mode = 'ground'; R.gk = 'island'; R.under = false; R.rot = 0; R.airCarry = 0; }
 }
 
 function classify(G, P, R) {
   R.climb = null;
+  R.airCarry = 0;
   const wy = waterY(G, P.x);
   const g = ground(G, P.x, P.y - STEP_UP);
   if (g && g.y - P.y < 12 && g.y - wy < WADE_MAX) {
@@ -323,26 +366,31 @@ function stepGround(G, P, R, dt, dir, mul) {
   if (top && top.kind === 'island' && top.y < P.y - (2 + Math.abs(dx) * 2.4)) {
     nx = P.x + carry * dt; P.vx = 0;
   }
-  let g = ground(G, nx, P.y - STEP_UP);
+  // a raft deck is a step up; from island sand onto a beached raft it may be a taller one,
+  // because a wave can lift the deck end well above the beach
+  const reach = R.gk === 'island' ? STEP_RAFT : STEP_UP;
+  let g = ground(G, nx, P.y - reach);
   // too steep: a wall or a high ledge (the raft deck can be stepped onto from a beach)
-  if (g && g.y < P.y - (g.kind === 'raft' ? STEP_UP : 2 + Math.abs(dx) * 2.4)) {
+  if (g && g.y < P.y - (g.kind === 'raft' ? reach : 2 + Math.abs(dx) * 2.4)) {
     nx = P.x + carry * dt; P.vx = 0;
-    g = ground(G, nx, P.y - STEP_UP);
+    g = ground(G, nx, P.y - reach);
   }
   P.x = nx;
   if (g && g.y <= P.y + 5 + Math.abs(dx) * 2.5) {
     P.y = g.y; P.vy = 0; R.gk = g.kind;
   } else {
     R.mode = 'air'; R.coyote = 0.1; P.vy = 0;    // walked off an edge
+    R.airCarry = carry;                          // still moving with the raft he stepped off
     return;
   }
   const depth = P.y - waterY(G, P.x);
-  if (depth > WADE_MAX) { R.mode = 'swim'; R.under = false; R.rot = 0; return; }
+  if (depth > WADE_MAX) { R.mode = 'swim'; R.under = false; R.rot = 0; R.airCarry = 0; return; }
 
   if (R.jumpBuf > 0) {
     R.jumpBuf = 0;
     P.vy = -JUMP_V * (wade > 0.4 ? 0.75 : 1);
     R.mode = 'air'; R.coyote = 0;
+    R.airCarry = carry;                          // a jump on a drifting raft keeps its speed
     play('jump');
     if (depth > 2) splash(G, P.x, 0.35, false);
     return;
@@ -370,18 +418,20 @@ function stepAir(G, P, R, dt, dir, mul) {
   }
   P.vx = approach(P.vx, dir * WALK * mul, ACC_AIR * dt);
   P.vy += C.GRAVITY * dt;
-  if (P.vy < 0 && !input.up) P.vy += C.GRAVITY * 1.3 * dt;   // let go early = shorter hop
+  if (P.vy < 0 && !ctl.up) P.vy += C.GRAVITY * 1.3 * dt;   // let go early = shorter hop
   if (P.vy > 560) P.vy = 560;
-  let nx = P.x + P.vx * dt;
+  // the speed of the raft he jumped (or stepped) off stays with him through the air
+  const carry = Number.isFinite(R.airCarry) ? R.airCarry : 0;
+  let nx = P.x + (P.vx + carry) * dt;
   const ny = P.y + P.vy * dt;
   // island cliffs are walls
   const t1 = topAt(G, nx);
-  if (t1 && t1.kind === 'island' && t1.y < Math.min(P.y, ny) - 3) { nx = P.x; P.vx = 0; }
+  if (t1 && t1.kind === 'island' && t1.y < Math.min(P.y, ny) - 3) { nx = P.x; P.vx = 0; R.airCarry = 0; }
   // landing
   if (P.vy >= 0) {
     const g = ground(G, nx, P.y);
     if (g && ny >= g.y && g.y - waterY(G, nx) < WADE_MAX) {
-      P.x = nx; P.y = g.y; R.gk = g.kind; R.mode = 'ground';
+      P.x = nx; P.y = g.y; R.gk = g.kind; R.mode = 'ground'; R.airCarry = 0;
       R.landPow = clamp(P.vy / 420, 0, 1); R.landT = 0;
       if (P.vy > 120) play('step', { surface: g.kind, volume: 0.55 + 0.45 * R.landPow });
       P.vy = 0;
@@ -394,8 +444,10 @@ function stepAir(G, P, R, dt, dir, mul) {
 
 function enterWater(G, P, R) {
   const v = Math.abs(P.vy);
+  P.vx += Number.isFinite(R.airCarry) ? R.airCarry : 0;   // the raft's speed becomes his own
+  R.airCarry = 0;
   R.mode = 'swim';
-  R.under = !!input.down;
+  R.under = !!ctl.down;
   R.rot = R.under ? 0.5 : 0;
   splash(G, P.x, clamp(v / 300, 0.3, 1.3), true);
   play('splash', { volume: clamp(v / 320, 0.35, 1) });
@@ -430,7 +482,7 @@ function stepSwim(G, P, R, dt, dir, mul) {
     P.x = nx;
     P.y += P.vy * dt;
     // dive
-    if (input.down && R.jumpBuf <= 0) {
+    if (ctl.down && R.jumpBuf <= 0) {
       R.under = true;
       P.vy = Math.max(P.vy, 55);
       play('dive');
@@ -439,32 +491,40 @@ function stepSwim(G, P, R, dt, dir, mul) {
     }
   } else {
     // ---- free swimming under water, eight directions
-    const iy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+    const iy = (ctl.down ? 1 : 0) - (ctl.up ? 1 : 0);
     const len = Math.hypot(dir, iy) || 1;
     const sp = SWIM_DEEP * flip * mul;
     P.vx = approach(P.vx, (dir / len) * sp, (dir ? 230 : 110) * dt);
-    P.vy = approach(P.vy, iy ? (iy / len) * sp : -8, (iy ? 230 : 70) * dt);   // idle: drift up slowly
+    P.vy = approach(P.vy, iy ? (iy / len) * sp : -SWIM_IDLE_RISE, (iy ? 230 : 70) * dt);   // idle: drift up very slowly
     const spd = Math.hypot(P.vx, P.vy);
     const surge = spd > 15 ? 0.84 + 0.32 * Math.max(0, Math.sin(R.swimPh * TAU)) : 1;
     let nx = P.x + P.vx * dt * surge;
-    const tRot = spd > 14 ? Math.atan2(Math.abs(P.vx), -P.vy) : 0.25;
+    let tRot = spd > 14 ? Math.atan2(Math.abs(P.vx), -P.vy) : 0.25;
+    // in a low gap under the raft he stays stretched out instead of turning upright or head-down
+    if (raftRoom(G, span, P.x, extents(tRot)) < 0) tRot = Math.PI / 2;
     R.rot += (tRot - R.rot) * Math.min(1, dt * 5);
     nx = swimWall(G, P, nx);
+    // the gap between the raft's logs and a beach slope narrows: no squeezing in where he doesn't fit
+    if (span && span.y != null && nx !== P.x) {
+      const exm = extents(R.rot);
+      const r1 = raftRoom(G, span, nx, exm);
+      if (r1 < 0 && r1 < raftRoom(G, span, P.x, exm) - 0.01) { nx = P.x; P.vx *= 0.2; }
+    }
     P.x = nx;
     P.y += P.vy * dt * surge;
   }
 
   // ---- the floor (seabed, island slopes) and the raft's underside
   const ex = extents(R.rot);
-  const fl = ground(G, P.x, P.y - PELVIS);
-  if (fl && fl.kind !== 'raft') {
-    const lim = fl.y + PELVIS - ex.down;
-    if (P.y > lim) { P.y = lim; if (P.vy > 0) P.vy = 0; }
-  }
+  const fl = floorAt(G, P.x, P.y - PELVIS);
+  const flim = fl ? fl.y + PELVIS - ex.down : Infinity;
+  if (P.y > flim) { P.y = flim; if (P.vy > 0) P.vy = 0; }
   let underRaft = false;
-  if (span && span.y != null && P.x > span.x0 + 1 && P.x < span.x1 - 1) {
-    const lim = span.y + RAFT_UNDER + PELVIS + ex.up;
-    if (P.y < lim) { P.y = lim; if (P.vy < 0) P.vy = 0; underRaft = true; R.under = true; }
+  const rlim = raftCeil(G, span, P.x, ex);
+  if (rlim != null && P.y < rlim) {
+    underRaft = true; R.under = true;
+    if (rlim <= flim) { P.y = rlim; if (P.vy < 0) P.vy = 0; }
+    else escapeRaft(G, P, span, dt);   // no room between the logs and the sand: never into the sand, back out
   }
 
   // ---- surfacing
@@ -472,7 +532,7 @@ function stepSwim(G, P, R, dt, dir, mul) {
     const hy = P.y - PELVIS - HEAD_UP * Math.cos(R.rot);
     const hx = P.x + P.facing * HEAD_UP * Math.sin(R.rot);
     const hw = waterY(G, hx);
-    if (hy < hw + 1 && !input.down) {
+    if (hy < hw + 1 && !ctl.down) {
       R.under = false;
       P.vy *= 0.3;
       splash(G, hx, 0.35, false);
@@ -511,25 +571,52 @@ function stepSwim(G, P, R, dt, dir, mul) {
     const ahead = topAt(G, P.x + P.facing * 9);
     if (ahead && ahead.kind === 'island' && ahead.y < wy + 2 && ahead.y > wy - 18) {
       R.jumpBuf = 0;
-      R.mode = 'air'; R.coyote = 0;
+      R.mode = 'air'; R.coyote = 0; R.airCarry = 0;
       P.vy = -270; P.vx = P.facing * 55;
       play('jump'); splash(G, P.x, 0.35, false);
     }
   }
 }
 
-// Horizontal movement in water stops against steep terrain (island cliffs, seabed walls).
+// Horizontal movement in water stops against steep terrain (island cliffs, seabed walls) —
+// also under the raft, where the deck would otherwise hide the slope beneath it.
 function swimWall(G, P, nx) {
   if (Math.abs(nx - P.x) < 1e-4) return nx;
-  const t0 = topAt(G, P.x), t1 = topAt(G, nx);
-  if (t1 && t1.kind !== 'raft' && t1.y < P.y - 3 && (!t0 || t1.y < t0.y - 4)) { P.vx *= 0.2; return P.x; }
+  const t0 = floorAt(G, P.x), t1 = floorAt(G, nx);
+  if (t1 && t1.y < P.y - 3 && (!t0 || t1.y < t0.y - 4)) { P.vx *= 0.2; return P.x; }
   return nx;
+}
+
+// The highest the swimming body's reference point (P.y) may be at x under the raft's logs,
+// or null when x is not under the raft.
+function raftCeil(G, span, x, ex) {
+  if (!span || span.y == null || !(x > span.x0 + 1 && x < span.x1 - 1)) return null;
+  const d = deck(G, x);
+  return (d != null ? d : span.y) + RAFT_UNDER + PELVIS + ex.up;
+}
+// Spare room for a swimming body between the raft's underside and the floor at x
+// (negative: he doesn't fit; Infinity: not under the raft).
+function raftRoom(G, span, x, ex) {
+  const c = raftCeil(G, span, x, ex);
+  if (c == null) return Infinity;
+  const fl = floorAt(G, x);
+  return fl ? fl.y + PELVIS - ex.down - c : Infinity;
+}
+// Squeezed between the logs and the sand (a beached raft): drift back out toward open water,
+// i.e. toward the raft end over the deeper floor.
+function escapeRaft(G, P, span, dt) {
+  const a = floorAt(G, span.x0 - 8), b = floorAt(G, span.x1 + 8);
+  const side = (a ? a.y : 1e4) >= (b ? b.y : 1e4) ? -1 : 1;
+  P.x += side * 45 * dt;
+  if (P.vx * side < 0) P.vx = 0;
 }
 
 function raftEdge(G, P, R) {
   const span = raftSpan(G);
   if (!span || span.y == null || R.mode !== 'swim') return null;
   if (P.x < span.x0 - 18 || P.x > span.x1 + 18) return null;
+  // only from beside either end, never up through the logs from underneath
+  if (P.x > span.x0 + CLIMB_SLACK && P.x < span.x1 - CLIMB_SLACK) return null;
   const hy = P.y - PELVIS - HEAD_UP * Math.cos(R.rot);
   if (hy - waterY(G, P.x) > 16) return null;
   const side = P.x < (span.x0 + span.x1) / 2 ? -1 : 1;
@@ -538,9 +625,9 @@ function raftEdge(G, P, R) {
 
 function startClimb(G) {
   const P = G.player, R = rt(G);
-  if (R.mode !== 'swim' || R.dead) return;
+  if (R.mode !== 'swim' || R.dead || R.frozen) return;
   const span = raftSpan(G);
-  if (!span || span.y == null) return;
+  if (!span || span.y == null || !raftEdge(G, P, R)) return;   // the prompt may be a step old
   const side = P.x < (span.x0 + span.x1) / 2 ? -1 : 1;
   const edge = side < 0 ? span.x0 : span.x1;
   // stored relative to the raft edge and the water, so the drifting raft carries the climb
@@ -581,7 +668,7 @@ function breathe(G, P, R, dt) {
   if (R.headUnder) {
     P.oxygen = Math.max(0, P.oxygen - O2_DRAIN * dt);
     if (P.oxygen <= 0) P.hp -= DROWN_DPS * dt;
-    if (P.oxygen < 30 && !R.warn.o2) { R.warn.o2 = true; say(G, '快没气了！快浮上去换气', 'warn'); }
+    if (P.oxygen < 30 && !R.warn.o2) { R.warn.o2 = true; say(G, hint('快没气了！按住 W 或空格浮上去换气', '快没气了！按住「上」浮上去换气'), 'warn'); }
   } else {
     P.oxygen = Math.min(C.MAX_STAT, P.oxygen + O2_FILL * dt);
   }
@@ -597,13 +684,23 @@ function survive(G, P, R, dt) {
     R.starve = P.thirst <= 0 ? 'thirst' : 'hunger';
   } else {
     R.starve = '';
-    if (P.hunger > 60 && P.thirst > 60 && P.oxygen > 0) P.hp += 0.6 * dt;
+    if (P.hunger > 60 && P.thirst > 60 && P.oxygen > 0) P.hp += HP_REGEN * dt;
   }
   P.hp = clamp(P.hp, 0, C.MAX_STAT);
 
-  if (P.hunger < 20 && !R.warn.hunger) { R.warn.hunger = true; say(G, '肚子饿得咕咕叫……按 F 吃点东西', 'warn'); }
+  if (P.hunger < 20 && !R.warn.hunger) {
+    R.warn.hunger = true;
+    say(G, FOODS.some((f) => has(G, f) > 0)
+      ? hint('肚子饿得咕咕叫……按 F 吃点东西', '肚子饿得咕咕叫……点「吃」吃点东西')
+      : '肚子饿得咕咕叫……去钩点漂流物，或者下水抓鱼', 'warn');
+  }
   if (P.hunger > 35) R.warn.hunger = false;
-  if (P.thirst < 20 && !R.warn.thirst) { R.warn.thirst = true; say(G, '嗓子干得冒烟……按 R 喝水', 'warn'); }
+  if (P.thirst < 20 && !R.warn.thirst) {
+    R.warn.thirst = true;
+    say(G, has(G, 'water') > 0 || has(G, 'coconut') > 0
+      ? hint('嗓子干得冒烟……按 R 喝水', '嗓子干得冒烟……点「喝」喝水')
+      : noWaterText(G, '嗓子干得冒烟……'), 'warn');
+  }
   if (P.thirst > 35) R.warn.thirst = false;
 }
 
@@ -638,7 +735,12 @@ export function hurtPlayer(G, dmg, fromX, kind) {
   R.hurtDir = d;
   if (R.mode === 'swim') { P.vx = d * 110; P.vy -= 25; }
   else if (R.mode === 'climb') { /* hold on */ }
-  else { P.vx = d * 150; P.vy = -150; R.mode = 'air'; R.coyote = 0; }
+  else {
+    // knocked off his feet; on a drifting raft he keeps its speed through the air
+    const span = raftSpan(G);
+    R.airCarry = R.mode === 'ground' && R.gk === 'raft' && span ? span.vx : R.mode === 'air' ? R.airCarry || 0 : 0;
+    P.vx = d * 150; P.vy = -150; R.mode = 'air'; R.coyote = 0;
+  }
   R.charging = false;
   G.shake = (G.shake || 0) + 0.35;
   play('hurt');
@@ -654,7 +756,7 @@ function selectTool(G, P, R, n) {
   if (n === 1) next = 'hook';
   else if (n === 2) {
     if (has(G, 'spear') > 0) next = 'spear';
-    else { say(G, '还没有鱼叉——按 Tab 打开背包制作'); return; }
+    else { say(G, hint('还没有鱼叉——按 Tab 打开背包制作', '还没有鱼叉——点「背包」制作')); return; }
   } else if (n === 3) {
     if (has(G, 'hammer') > 0) next = 'hammer';
     else { say(G, '锤子不见了……'); return; }
@@ -704,7 +806,7 @@ function hookInput(G, P, R, dt) {
   }
   if (!R.charging) return;
   if (input.aimFromPointer && Math.abs(input.mouse.wx - P.x) > 4) P.facing = input.mouse.wx > P.x ? 1 : -1;
-  if (input.use) {
+  if (ctl.use) {
     R.charge = Math.min(1, R.charge + dt / CHARGE_TIME);
   } else {
     // released: throw
@@ -764,9 +866,9 @@ function updateHook(G, P, R, dt) {
       d = ROPE_MAX;
     }
     h.len = Math.max(d, Math.min(h.len, d + 50));
-    if (input.use && P.tool === 'hook' && !R.charging) h.state = 'reeling';
+    if (ctl.use && P.tool === 'hook' && !R.charging) h.state = 'reeling';
   } else if (h.state === 'reeling') {
-    if (!h.fast && !input.use) h.state = 'floating';
+    if (!h.fast && !ctl.use) h.state = 'floating';
     else {
       const step = (h.fast ? 430 : REEL_SPEED) * dt;
       const ax = hx - h.x;
@@ -800,14 +902,14 @@ function finishHook(G, collect) {
   G.hook = null;
 }
 
-function spearAndHammer(G, P, R, dt) {
+function spearAndHammer(G, P, R, dt, act) {
   const under = R.mode === 'swim' && R.under;
-  if (P.tool === 'spear' && input.usePressed && R.spearCD <= 0 && has(G, 'spear') > 0) {
+  if (act && P.tool === 'spear' && input.usePressed && R.spearCD <= 0 && has(G, 'spear') > 0) {
     const sx = P.x + R.off.shoulder[0], sy = P.y + R.off.shoulder[1];
     let a;
     if (input.aimFromPointer && Number.isFinite(input.mouse.wx)) a = Math.atan2(input.mouse.wy - sy, input.mouse.wx - sx);
     else {
-      const iy = R.mode === 'swim' ? (input.down ? 1 : 0) - (input.up ? 1 : 0) : 0;
+      const iy = R.mode === 'swim' ? (ctl.down ? 1 : 0) - (ctl.up ? 1 : 0) : 0;
       a = Math.atan2(iy * 0.8, P.facing);
     }
     P.facing = Math.cos(a) >= 0 ? 1 : -1;
@@ -824,12 +926,27 @@ function spearAndHammer(G, P, R, dt) {
       S.hit = true;
       const sx = P.x + R.off.shoulder[0], sy = P.y + R.off.shoulder[1];
       const tx = sx + Math.cos(S.a) * SPEAR_REACH, ty = sy + Math.sin(S.a) * SPEAR_REACH;
-      addHit(G, tx, ty, 12, 25, 'spear', 'player');
+      addHit(G, tx, ty, SPEAR_R, 25, 'spear', 'player');
       if (ty > waterY(G, tx)) bubbleBurst(G, tx, ty, 3);
     }
     if (S.t >= S.dur) R.spear = null;
   }
-  if (P.tool === 'hammer' && input.usePressed && R.swingT > 0.3) R.swingT = 0;
+  if (act && P.tool === 'hammer' && input.usePressed && R.swingT > 0.3) R.swingT = 0;
+}
+
+// No bottled water (or coconut) left: point at the purifier if there is one, else suggest
+// building one. `lead` opens the sentence ('没有淡水了……').
+function noWaterText(G, lead) {
+  const tiles = G.raft && Array.isArray(G.raft.tiles) ? G.raft.tiles : [];
+  let n = 0, water = 0;
+  for (const t of tiles) {
+    const s = t && t.s;
+    if (s && s.type === 'purifier') { n++; water += Number(s.water) > 0 ? Number(s.water) : 0; }
+  }
+  if (water > 0) return lead + hint('净水器里接到了水，走过去按 E 喝', '净水器里接到了水，走过去点「互动」喝');
+  if (n > 0) return lead + '净水器还在收集，白天晒一晒，下雨时会快很多';
+  if (has(G, 'purifier') > 0) return lead + hint('背包里有净水器，按 3 拿锤子把它装到木筏上', '背包里有净水器，拿起锤子把它装到木筏上');
+  return lead + hint('按 Tab 打开背包，造一个净水器吧', '点「背包」造一个净水器吧');
 }
 
 function eatDrink(G, P, R) {
@@ -849,7 +966,7 @@ function eatDrink(G, P, R) {
     if (R.headUnder) say(G, '在水下没法喝水');
     else {
       const id = has(G, 'water') > 0 ? 'water' : has(G, 'coconut') > 0 ? 'coconut' : null;
-      if (!id) say(G, '没有淡水了……造一个净水器吧');
+      if (!id) say(G, noWaterText(G, '没有淡水了……'));
       else {
         let ok = false;
         try { ok = useItem(G, id); } catch (e) { oops('useItem', e); }
