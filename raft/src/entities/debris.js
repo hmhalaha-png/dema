@@ -2,9 +2,9 @@
 //
 // The sea brings the boy his building materials: planks, plastic bottles, tangled nets,
 // rusty sheet metal, soaked cloth, palm fronds, barrels, the odd crate hanging under the
-// surface and — further along the journey — message bottles with letters from a girl who
-// also drifted (letter k turns up once the raft is past k × LETTER_STEP). Everything is painted procedurally into small cached sprites (one per
-// type × variant) and drawn bobbing and rolling on the waves.
+// surface and — further and further along the journey — message bottles with letters from
+// a girl who also drifted. Everything is painted procedurally into small cached sprites
+// (one per type × variant) and drawn bobbing and rolling on the waves.
 //
 // Exports (CONTRACT §5): init, update, draw, hookCatch, collectAttached.
 // Extra: spawnDebrisNear(G, x, n) (used by life.debugSpawn), LETTERS.
@@ -105,6 +105,7 @@ export function init(G) {
   };
   const F = flags(G);
   if (typeof F.notes !== 'number') F.notes = 0;
+  delete F.noteDay;   // older saves: letters are no longer limited to one a day
   // populate the sea around the raft so the very first look already offers something
   const R = G.raft;
   const W = viewW(G);
@@ -144,6 +145,13 @@ function letterDue(G) {
   const rx = G.raft && isFinite(G.raft.x) ? G.raft.x : 0;
   return k < LETTERS.length && rx > k * LETTER_STEP;
 }
+// A bottle still within the boy's reach (ahead of or beside the raft, or on the hook)? One
+// that has already drifted away behind the raft doesn't hold up the next one.
+function noteAhead(G) {
+  const rx = G.raft && isFinite(G.raft.x) ? G.raft.x : 0;
+  for (const d of G.debris) if (d.type === 'note' && (d.attached || d.x > rx - 250)) return true;
+  return false;
+}
 
 function spawn(G, x, forceType, initial) {
   if (!isFinite(x)) return null;
@@ -155,7 +163,7 @@ function spawn(G, x, forceType, initial) {
   // (nothing is remembered at spawn time: a bottle that drifts away or a reload just means
   // another one comes by a little later)
   if (!forceType && !G.demo && !initial && letterDue(G) && G.phase > 0.08 && G.phase < 0.9
-    && chance(LETTER_CHANCE) && !G.debris.some((d) => d.type === 'note')) {
+    && chance(LETTER_CHANCE) && !noteAhead(G)) {
     type = 'note';
   }
   if (!forceType && type !== 'note' && chance(0.035)) type = 'crate';

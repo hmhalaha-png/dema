@@ -120,9 +120,10 @@ function splash(G, x, n, power = 1) {
   if (dryLand(G, x)) return;
   const y = wy(G, x);
   for (let i = 0; i < n; i++) {
-    const sx = x + rand(-6, 6) * power;
-    if (i && dryLand(G, sx)) continue;
-    emit(G, { x: sx, y: y - 1, vx: rand(-40, 40) * power, vy: rand(-120, -40) * power, life: rand(0.5, 1.0), size: rand(1, 2.4), gravity: 300, color: [232, 244, 248], alpha: 0.85, water: 'above' });
+    const sx = x + rand(-6, 6) * power, vx = rand(-40, 40) * power;
+    // no droplet may start on, or fall onto, a beach
+    if ((i && dryLand(G, sx)) || dryLand(G, sx + vx * 0.5)) continue;
+    emit(G, { x: sx, y: y - 1, vx, vy: rand(-120, -40) * power, life: rand(0.5, 1.0), size: rand(1, 2.4), gravity: 300, color: [232, 244, 248], alpha: 0.85, water: 'above' });
   }
   for (let i = 0; i < Math.ceil(n / 3); i++) {
     const bx = x + rand(-8, 8) * power, by = y + rand(2, 6);
@@ -251,6 +252,7 @@ function updateSchools(G, dt, B) {
 function catchFish(G, s, f) {
   s.fish.splice(s.fish.indexOf(f), 1);
   s.panic = 3;
+  s.wary = WARY_T;   // the rest of the school stays skittish for a while
   if (!G.demo) {
     try { addItem(G, 'raw_fish', 1); } catch (e) { G.inv.raw_fish = (G.inv.raw_fish || 0) + 1; }
     sfx('fishcatch');
@@ -261,7 +263,12 @@ function catchFish(G, s, f) {
   }
 }
 
-const FLEE_R = 60, FLEE_SPEED = 20, FLEE_CLOSE = 32, PANIC_MAX = 52;   // the boy swims 64 u/s
+// A calm school lets a still or slowly gliding diver come within a spear's reach; it bolts
+// from a swimming boy, a little slower than he swims (64 u/s). Once one of them is speared,
+// the rest stay wary for a while: they startle at any stroke from further away and dart off
+// at full speed, so the next catch is usually another school's.
+const FLEE_R = 60, FLEE_SPEED = 20, FLEE_CLOSE = 32, PANIC_MAX = 52;
+const WARY_T = 12, WARY_R = 84, WARY_SPEED = 8, WARY_CLOSE = 50;
 function stepSchool(G, s, dt, B) {
   const sp = SPECIES[s.sp], fish = s.fish, n = fish.length;
   if (!n) return;
@@ -272,6 +279,7 @@ function stepSchool(G, s, dt, B) {
   s.cx = cx; s.cy = cy;
   s.wt += dt;
   s.panic = Math.max(0, s.panic - dt);
+  s.wary = Math.max(0, (s.wary || 0) - dt);
   const fl = floorAt(G, cx);
 
   // where the school wants to be
@@ -298,9 +306,8 @@ function stepSchool(G, s, dt, B) {
   }
   const t = G.time;
   const sepR = sp.L * 1.15;
-  // Fish shy away from a swimming boy, but a still or slowly gliding diver can get within a
-  // spear's reach; once they bolt they are only a little slower than he is.
-  const fleeR = FLEE_R;
+  const wary = s.wary > 0;
+  const fleeR = wary ? WARY_R : FLEE_R, fleeSpeed = wary ? WARY_SPEED : FLEE_SPEED, fleeClose = wary ? WARY_CLOSE : FLEE_CLOSE;
   const cruise = sp.speed * (lanternCall ? 1.1 : 1);
   for (let i = 0; i < n; i++) {
     const f = fish[i];
@@ -320,7 +327,7 @@ function stepSchool(G, s, dt, B) {
       const dx = f.x - B.cx, dy = f.y - B.cy;
       if (dx < fleeR && dx > -fleeR && dy < fleeR && dy > -fleeR) {
         const d = Math.hypot(dx, dy) || 1;
-        if (d < fleeR && (B.speed > FLEE_SPEED || d < FLEE_CLOSE)) {
+        if (d < fleeR && (B.speed > fleeSpeed || d < fleeClose)) {
           const k = (1 - d / fleeR) * 1100;
           ax += (dx / d) * k; ay += (dy / d) * k;
           s.panic = Math.max(s.panic, 1.2);
@@ -333,7 +340,7 @@ function stepSchool(G, s, dt, B) {
     if (f.y > fy - 16) ay -= (f.y - fy + 16) * 9;
     f.vx += ax * dt; f.vy += ay * dt;
     f.vy *= 1 - Math.min(1, dt * 1.2);
-    const maxS = s.panic > 0 ? Math.min(cruise * 3.4, PANIC_MAX) : cruise * 1.5, minS = cruise * 0.35;
+    const maxS = s.panic > 0 ? (wary ? cruise * 3.4 : Math.min(cruise * 3.4, PANIC_MAX)) : cruise * 1.5, minS = cruise * 0.35;
     const spd = Math.hypot(f.vx, f.vy) || 0.01;
     if (spd > maxS) { f.vx *= maxS / spd; f.vy *= maxS / spd; } else if (spd < minS) { f.vx *= minS / spd; f.vy *= minS / spd; }
     f.x += f.vx * dt; f.y += f.vy * dt;
@@ -382,8 +389,12 @@ function updShark(G, c, dt, B) {
   if (c.hidden) {
     c.fleeT -= dt;
     if (c.fleeT <= 0) {
-      const side = chance(0.5) ? -1 : 1;
-      Object.assign(c, { hidden: false, state: 'patrol', st: 0, hp: 3, x: mid + side * (W * 0.75), y: 60, dir: -side, face: -side, speed: 50, biteT: rand(60, 90) });
+      // come back from the open sea (never out of an island's side)
+      let side = chance(0.5) ? -1 : 1;
+      if (!deepRun(G, mid + side * W * 0.75, mid + side * W * 0.75)) side = -side;
+      const x = mid + side * W * 0.75;
+      if (!deepRun(G, x, x)) { c.fleeT = 3; return; }
+      Object.assign(c, { hidden: false, state: 'patrol', st: 0, hp: c.state === 'flee' ? 3 : c.hp, x, y: 60, dir: -side, face: -side, speed: 50, biteT: c.state === 'flee' ? rand(60, 90) : Math.max(c.biteT, 20) });
     }
     return;
   }
@@ -428,7 +439,7 @@ function updShark(G, c, dt, B) {
       ty = c.surf ? 17 : 52 + Math.sin(c.st * 0.3) * 30;
       want = c.surf ? 36 : 44;
       if (lampGuard) c.biteT = Math.max(c.biteT, 30);
-      else c.biteT -= dt * (isDark(G) ? 1.7 : 1);
+      else c.biteT -= dt * (isDark(G) ? 1.4 : 1);
       if (boyNear && c.cd <= 0) { c.state = 'stalk'; c.st = 0; c.orbit = Math.atan2(c.y - B.cy, c.x - B.cx); }
       else if (c.biteT <= 0 && !shallow && !B.inWater && G.mode === 'play' && R.tiles && R.tiles.length >= 2 && G.time > 100) {
         c.state = 'biteGo'; c.st = 0; c.biteSide = c.x < mid ? -1 : 1; c.bit = false;
@@ -511,6 +522,16 @@ function updShark(G, c, dt, B) {
     }
   }
 
+  // islands: the shark never swims up a beach or over the land. If its way leads across an
+  // island (the raft sailed around it), it turns back to the open sea and, once out of
+  // sight, slips away to come back later on the raft's side.
+  if (!deepRun(G, c.x, tx)) {
+    if (!onScreen(G, c.x, c.y, SHARK_L)) { c.hidden = true; c.fleeT = rand(6, 12); return; }
+    const land = deepRun(G, c.x, c.x + 160) ? -1 : 1;   // which way the shallows lie
+    tx = c.x - land * 240; ty = Math.min(60, floorAt(G, c.x) - 30); want = Math.max(want, 60);
+    if (c.state === 'lunge' || c.state === 'stalk' || c.state === 'biteGo' || c.state === 'biteRush') { c.state = 'retreat'; c.st = 0; }
+  }
+
   // steering: turn around through a squash (a 2.5D turn), pitch toward the target
   const dx = tx - c.x, dy = ty - c.y;
   if (Math.abs(dx) > 24) c.dir = sgn(dx);
@@ -523,6 +544,18 @@ function updShark(G, c, dt, B) {
   c.y += Math.sin(c.pitch) * c.speed * dt;
   c.tail += dt * (2.5 + c.speed * 0.06);
   return finishShark(G, c, dt);
+}
+
+// Deep enough for the shark all the way from a to b (no island beach or land between)?
+// (the open seabed is always far deeper than this; only islands rise this high)
+const SHARK_FLOOR = 46;
+function deepRun(G, a, b) {
+  const lo = Math.min(a, b), hi = Math.max(a, b);
+  for (let x = lo; ; x += 40) {
+    const g = islandGround(G, Math.min(x, hi));
+    if (g != null && g < SHARK_FLOOR) return false;
+    if (x >= hi) return true;
+  }
 }
 
 function finishShark(G, c, dt) {
@@ -576,9 +609,36 @@ function placeGull(c, b, t) {
   b.x = x; b.y = y;
 }
 
+// Open water between a and b (no island ground at or above the surface, nor shallower than
+// `depth` below it)?
+function openWater(G, a, b, depth = 24) {
+  const lo = Math.min(a, b), hi = Math.max(a, b);
+  for (let x = lo; x <= hi; x += 40) {
+    const g = islandGround(G, x);
+    if (g != null && g < wy(G, x) + depth) return false;
+  }
+  return true;
+}
+// Would a flying fish (or dolphin) leaping at x toward dir come down on (or glide over) land?
+const FLYER_LEAP = 400;   // a leap with its skips covers about this much ground
+const flyerBlocked = (G, x, dir) => !openWater(G, x, x + dir * FLYER_LEAP);
+
+// Which way should a pod crossing the view swim? In from a side of the view where the sea is
+// open and deep (never out of an island), so it meets no beach on its way or turns away from
+// it. 0: no open sea on either side (the boy is in the middle of an island).
+function openDir(G) {
+  const W = viewW(G), cx = G.cam.x;
+  const left = openWater(G, cx - W * 0.95, cx - W * 0.45, 150), right = openWater(G, cx + W * 0.45, cx + W * 0.95, 150);
+  if (left && !right) return 1;
+  if (right && !left) return -1;
+  if (!left && !right) return 0;
+  return chance(0.5) ? 1 : -1;
+}
+
 function spawnFlyingFish(G, dir, x0) {
-  dir = dir || (chance(0.5) ? 1 : -1);
   const W = viewW(G);
+  if (!dir && x0 == null) dir = openDir(G);
+  dir = dir || (chance(0.5) ? 1 : -1);
   const fish = [];
   x0 = x0 != null ? x0 : G.cam.x - dir * (W * 0.5 + 40);
   const n = randi(10, 15);
@@ -591,6 +651,7 @@ function spawnFlyingFish(G, dir, x0) {
 }
 
 function spawnDolphins(G, dir, x0) {
+  if (!dir && x0 == null) dir = openDir(G);
   dir = dir || (chance(0.5) ? 1 : -1);
   const W = viewW(G);
   x0 = x0 != null ? x0 : G.cam.x - dir * (W * 0.55 + 80);
@@ -606,6 +667,7 @@ function spawnDolphins(G, dir, x0) {
 }
 
 function spawnTurtle(G, dir, x) {
+  if (!dir && x == null) dir = openDir(G);
   dir = dir || (chance(0.5) ? 1 : -1);
   const W = viewW(G);
   const c = { kind: 'turtle', layer: 'main', x: x != null ? x : G.cam.x - dir * (W * 0.5 + 60), y: rand(48, 66), base: rand(48, 66), dir, t: 0, ph: rand(0, 6), seen: false, major: true, breathed: false };
@@ -614,6 +676,7 @@ function spawnTurtle(G, dir, x) {
 }
 
 function spawnManta(G, dir, x) {
+  if (!dir && x == null) dir = openDir(G);
   dir = dir || (chance(0.5) ? 1 : -1);
   const W = viewW(G);
   const base = rand(84, 104);
@@ -782,7 +845,7 @@ function scheduler(G, dt, B) {
   const majorActive = G.creatures.some((c) => MAJOR[c.kind] && !c.dead);
 
   // first-day promises: flying fish in the morning, plankton on the first night
-  if (G.day === 1 && !G.codex.flying_fish && L.t > 26 && ph < 0.5 && !has(G, 'flying_fish')) {
+  if (G.day === 1 && !G.codex.flying_fish && L.t > 26 && ph < 0.5 && !has(G, 'flying_fish') && openDir(G) !== 0) {
     spawnFlyingFish(G); L.cool = Math.max(L.cool, 70); L.last = 'flying_fish';
   }
   if (!G.codex.plankton && ph > 0.67 && ph < 0.93 && !has(G, 'plankton')) spawnPlankton(G);
@@ -817,17 +880,18 @@ function scheduler(G, dt, B) {
   const w = (k, v) => { if (v > 0 && k !== L.last) cand.push([k, v * (G.codex[k] ? 1 : 2.5)]); };
   const deepBelow = floorAt(G, raftMid(G)) > 430 && islandGround(G, raftMid(G) + 400) == null && islandGround(G, raftMid(G) - 400) == null;
   const wet = stormy(G) ? 0.25 : 1;
+  const sea = openDir(G) !== 0 ? 1 : 0;   // the pods cross the view from the open sea
   if (dayTime) {
-    w('flying_fish', 3 * wet); w('dolphin', 3 * wet); w('turtle', 2.2); w('manta', 2);
+    w('flying_fish', 3 * wet * sea); w('dolphin', 3 * wet * sea); w('turtle', 2.2 * sea); w('manta', 2 * sea);
     if (deepBelow && G.day - PL.whaleDay >= 2) w('whale', 1.3);
   } else if (ph >= 0.5 && ph < 0.6) {
-    w('dolphin', 2); w('flying_fish', 1.4);
+    w('dolphin', 2 * sea); w('flying_fish', 1.4 * sea);
     if (deepBelow && G.day - PL.whaleDay >= 2) w('whale', 0.8);
   } else if (isDark(G)) {
     w('jelly', 3);
     if (!has(G, 'plankton')) w('plankton', 2.4);
     const mb = moonBreach(G);
-    if (mb && mb.ok && G.view.seaScreenY > 80) w('moon_whale', mb.k < 1.5 ? 2.6 : 1.9);
+    if (mb && mb.ok && G.view.seaScreenY > 80) w('moon_whale', mb.k < 1.5 ? 2.6 : 1.3);   // best with a low moon
     if (G.day >= 2 && G.day - PL.levDay >= 2 && G.view.seaScreenY > 120) w('leviathan', 0.9);
   }
   if (!cand.length) { L.cool = 12; return; }
@@ -886,7 +950,7 @@ function updFlyingFish(G, c, dt) {
   for (const f of c.fish) {
     if (f.gone) continue;
     alive++;
-    if (f.delay > 0) { f.delay -= dt; continue; }
+    if (f.delay > 0) { f.delay -= dt; if (f.delay > 0) continue; }
     const w = wy(G, f.x);
     // an island in the way: the fish slips away under the water (gone) instead of flying,
     // swimming or splashing inside the soil — in the water at a dry-land column or at an
@@ -895,11 +959,15 @@ function updFlyingFish(G, c, dt) {
     if (g != null && (f.y > g - 3 || (f.mode !== 'air' && g < w + 1))) { f.gone = true; continue; }
     if (f.mode === 'swim') {
       f.x += f.vx * dt;
-      f.vy += (-70 - f.vy) * Math.min(1, dt * 3);
-      f.y += f.vy * dt;
-      if (f.y <= w + 1) {
-        f.mode = 'air'; f.vy = -rand(150, 215); f.vx = c.dir * rand(185, 240);
-        if (onScreen(G, f.x, f.y, 30)) splash(G, f.x, 3, 0.45);
+      // land ahead: it never takes off toward the beach, it turns down and away
+      if (f.y < w + 14 && flyerBlocked(G, f.x, c.dir)) { f.mode = 'dive'; f.vy = 40; }
+      else {
+        f.vy += (-70 - f.vy) * Math.min(1, dt * 3);
+        f.y += f.vy * dt;
+        if (f.y <= w + 1) {
+          f.mode = 'air'; f.vy = -rand(150, 215); f.vx = c.dir * rand(185, 240);
+          if (onScreen(G, f.x, f.y, 30)) splash(G, f.x, 3, 0.45);
+        }
       }
     } else if (f.mode === 'air') {
       anyAir = true;
@@ -907,13 +975,16 @@ function updFlyingFish(G, c, dt) {
       f.x += f.vx * dt; f.y += f.vy * dt;
       if (f.y > w && f.vy > 0) {
         if (onScreen(G, f.x, f.y, 30)) splash(G, f.x, 4, 0.55);
-        if (f.skips > 0 && chance(0.75)) { f.skips--; f.y = w - 0.5; f.vy = -rand(100, 150); f.vx *= 0.92; }
+        if (f.skips > 0 && chance(0.75) && !flyerBlocked(G, f.x, c.dir)) { f.skips--; f.y = w - 0.5; f.vy = -rand(100, 150); f.vx *= 0.92; }
         else { f.mode = 'dive'; f.vy = 60; }
       }
     } else {
       f.x += f.vx * 0.6 * dt; f.vy += (25 - f.vy) * dt; f.y += f.vy * dt;
       if (f.y > 70) f.gone = true;
     }
+    // ...and the same after this step's move, so it is never drawn inside the soil
+    const g2 = islandGround(G, f.x);
+    if (g2 != null && (f.y > g2 - 3 || (f.mode !== 'air' && g2 < wy(G, f.x) + 1))) { f.gone = true; continue; }
     f.ang = Math.atan2(f.vy, Math.abs(f.vx));
     f.ph += dt * 30;
     if ((f.x - G.cam.x) * c.dir > W * 0.7) f.gone = true;
@@ -931,6 +1002,11 @@ function updDolphins(G, c, dt) {
     if (d.gone) continue;
     alive++;
     const w = wy(G, d.x);
+    // islands, as for the flying fish: never inside the soil, no leaps toward the beach
+    const g = islandGround(G, d.x);
+    if (g != null && (d.y > g - 4 || (d.mode !== 'air' && g < w + 1))) { d.gone = true; continue; }
+    const shore = d.mode !== 'air' && flyerBlocked(G, d.x, c.dir);
+    if (shore) d.rising = false;
     d.tail += dt * (d.mode === 'air' ? 3 : 7);
     if (d.mode === 'air') {
       d.vy += 380 * dt;
@@ -942,7 +1018,7 @@ function updDolphins(G, c, dt) {
     } else {
       d.x += d.vx * dt;
       d.leapT -= dt;
-      if (d.leapT <= 0) d.rising = true;
+      if (d.leapT <= 0 && !shore) d.rising = true;
       if (d.rising) {
         d.vy += (-150 - d.vy) * Math.min(1, dt * 4);
         if (d.y <= w + 3) {
@@ -950,11 +1026,13 @@ function updDolphins(G, c, dt) {
           if (onScreen(G, d.x, d.y, 40)) { splash(G, d.x, 8, 0.8); if (chance(0.5)) sfx('splash'); }
         }
       } else {
-        const ty = 24 + Math.sin(c.t * 1.4 + d.ph) * 8;
+        const ty = shore ? 70 : 24 + Math.sin(c.t * 1.4 + d.ph) * 8;   // land ahead: down and away
         d.vy += ((ty - d.y) * 3 - d.vy * 1.6) * dt;
       }
       d.y += d.vy * dt;
     }
+    const g2 = islandGround(G, d.x);
+    if (g2 != null && (d.y > g2 - 4 || (d.mode !== 'air' && g2 < wy(G, d.x) + 1))) { d.gone = true; continue; }
     d.ang = Math.atan2(d.vy, Math.abs(d.vx));
     if ((d.x - G.cam.x) * c.dir > W * 0.75) d.gone = true;
     if (!c.seen && inView(G, d.x, d.y, 20)) see(G, c, 'dolphin');
@@ -962,8 +1040,20 @@ function updDolphins(G, c, dt) {
   if (!alive || c.t > 40) c.dead = true;
 }
 
+// A big slow swimmer meeting an island's slope turns back to the open sea (instead of being
+// pushed up the slope and over the land).
+function shoreTurn(G, c, dt, clear) {
+  c.turnCd = Math.max(0, (c.turnCd || 0) - dt);
+  const here = islandGround(G, c.x);
+  if (here != null && here < c.y + 12 && !onScreen(G, c.x, c.y, 80)) { c.dead = true; return; }   // stranded out of sight
+  if (c.turnCd > 0) return;
+  const g = islandGround(G, c.x + c.dir * 70);
+  if (g != null && g < c.y + clear) { c.dir = -c.dir; c.turnCd = 6; }
+}
+
 function updTurtle(G, c, dt) {
   c.t += dt;
+  shoreTurn(G, c, dt, 40);
   c.x += c.dir * 15 * dt;
   const mid = raftMid(G);
   // comes up for a breath when passing the raft
@@ -980,6 +1070,7 @@ function updTurtle(G, c, dt) {
 
 function updManta(G, c, dt) {
   c.t += dt;
+  shoreTurn(G, c, dt, 60);
   c.x += c.dir * 30 * dt;
   c.y = Math.min(c.base + Math.sin(c.t * 0.42 + c.ph) * 11, floorAt(G, c.x) - 50);
   if (!c.seen && inView(G, c.x, c.y, 30)) see(G, c, 'manta');
@@ -1106,6 +1197,7 @@ const MW_LIFT0 = 0.28;                    // apex height of its centre above the
 const MW_BELLY = 0.15;                    // the thick of the body sits this far ahead of the centre (head up)
 const MW_KMIN = 0.85, MW_KMAX = 2;        // how much it may be scaled to reach the moon
 const MW_LIFTMIN = 0.15, MW_LIFTMAX = 0.5;
+const MW_COVER = 0.36;                    // a high moon may be crossed further up, toward the head
 const mwLen = (G, c) => MW_LEN * unitOf(G) * (c.k || 1);
 
 // Where the moon hangs on screen and how to stage the breach so the body crosses it:
@@ -1120,8 +1212,10 @@ function moonBreach(G) {
   const r = isFinite(cel.moonR) ? cel.moonR : 20;
   const k = clamp(H / ((0.42 + MW_BELLY) * L0), MW_KMIN, MW_KMAX);
   const lift = clamp(H / (k * L0) - MW_BELLY, MW_LIFTMIN, MW_LIFTMAX);
-  const reach = (lift + MW_BELLY) * k * L0;
-  const ok = H > r * 0.5 && Math.abs(reach - H) < Math.max(10, r * 0.5) && cel.moonX > r && cel.moonX < v.cssW - r;
+  // where along the body (ahead of its centre, in body lengths) it passes the moon's centre:
+  // the thick of the body for a low moon, the broad head end for a high one
+  const cover = H / (k * L0) - lift, tol = Math.max(10, r * 0.5) / (k * L0);
+  const ok = H > r * 0.5 && cover > MW_BELLY - tol && cover < MW_COVER + tol && cel.moonX > r && cel.moonX < v.cssW - r;
   return { x: cel.moonX, H, k, lift, ok };
 }
 function horizonScreenX(G, c, fx) {

@@ -2,7 +2,7 @@
 //
 // The islands along the journey and everything that lives on them.
 //
-//  • Layout: five deterministic islands (x ≈ 2600, 6200, 10000, 14200, 17800) and the
+//  • Layout: five deterministic islands (x ≈ 1700, 6200, 10000, 14200, 17800) and the
 //    lighthouse rock at C.GOAL_X. Each one is a side-view terrain profile — a reef slope
 //    rising from the seabed to a shallow sandy shelf, a beach, hills, rock outcrops and
 //    sometimes a small cliff — sampled into a height table, so groundAt() is a lookup.
@@ -28,6 +28,8 @@ import { seabedY, addLight, addInteract, onScreen } from '../core/world.js';
 import { emit } from '../core/particles.js';
 import { TAU, clamp, lerp, smoothstep, noise1, fbm1, hash1, seeded, mixColor, makeCanvas, approach } from '../core/util.js';
 import { getAsset } from '../core/assets.js';
+import { hint } from '../core/input.js';
+import { celestial } from '../render/sky.js';
 import { addItem, ITEMS } from './inventory.js';
 import { hurtPlayer } from '../entities/player.js';
 import { sfx } from './audio.js';
@@ -49,7 +51,9 @@ const BEAST_DMG = 30;
 
 // ---- the journey -------------------------------------------------------------------
 const LAYOUT = [
-  { x: 2600, w: 640, seed: 11, theme: 'palms', name: '椰子岛', palms: 5, wood: 1, rocks: 1, bushes: 2, crabs: 3, peak: 62, cliff: false },
+  // the first island sits close: a drifting raft reaches it around phase 0.38 of day 1,
+  // leaving daylight to explore before the beast comes out
+  { x: 1700, w: 640, seed: 11, theme: 'palms', name: '椰子岛', palms: 5, wood: 1, rocks: 1, bushes: 2, crabs: 3, peak: 62, cliff: false },
   { x: 6200, w: 820, seed: 23, theme: 'drift', name: '浮木湾', palms: 3, wood: 4, rocks: 1, bushes: 2, crabs: 4, peak: 96, cliff: true },
   { x: 10000, w: 560, seed: 37, theme: 'rocky', name: '石头岛', palms: 2, wood: 1, rocks: 4, bushes: 1, crabs: 2, peak: 124, cliff: true },
   { x: 14200, w: 900, seed: 41, theme: 'forest', name: '雾林岛', palms: 3, wood: 2, rocks: 2, bushes: 3, crabs: 3, peak: 108, cliff: false },
@@ -369,6 +373,9 @@ function placeProps(I, def, rng) {
     }
     return null;
   };
+  // fallback when the themed beach/slope spot is taken or too steep: anywhere on the dry land
+  const dry0 = I.dryL - L + 6, dry1 = I.dryR - L - 6;
+  const placeAny = (r) => (dry1 > dry0 ? (tryPlace(dry0, dry1, r, 0.7, 240) ?? tryPlace(dry0, dry1, r * 0.7, 0.85, 240)) : null);
   const P = I.props = [];
   const add = (o) => { o.isl = I; o.y = gy(I, o.x); P.push(o); return o; };
 
@@ -384,9 +391,10 @@ function placeProps(I, def, rng) {
   const nPalm = def.palms || 0;
   for (let i = 0; i < nPalm; i++) {
     const onBeach = i % 2 === 0;
-    const x = onBeach
+    let x = onBeach
       ? (rng() < 0.5 ? tryPlace(I.beachL * 0.5, I.beachL * 1.3, 22, 0.45) : tryPlace(W - I.beachR * 1.3, W - I.beachR * 0.5, 22, 0.45))
       : tryPlace(I.beachL, W - I.beachR, 22, 0.45);
+    if (x == null) x = placeAny(22);
     if (x == null) continue;
     const h = lerp(78, 132, rng());
     const lean = (x < L + W / 2 ? -1 : 1) * lerp(0.08, 0.3, rng());
@@ -403,7 +411,7 @@ function placeProps(I, def, rng) {
   for (let i = 0; i < (def.wood || 0); i++) {
     const left = i % 2 === 0;
     const onL = () => tryPlace(14, I.beachL + 20, 16, 0.5), onR = () => tryPlace(W - I.beachR - 20, W - 14, 16, 0.5);
-    const x = left ? (onL() ?? onR()) : (onR() ?? onL());
+    const x = (left ? (onL() ?? onR()) : (onR() ?? onL())) ?? placeAny(16);
     if (x == null) continue;
     const logs = [];
     const n = 2 + (rng() < 0.6 ? 1 : 0) + (rng() < 0.3 ? 1 : 0);
@@ -414,13 +422,13 @@ function placeProps(I, def, rng) {
   }
   // rocks to knock stones off
   for (let i = 0; i < (def.rocks || 0); i++) {
-    const x = tryPlace(I.beachL * 0.7, W - I.beachR * 0.7, 18, 0.5);
+    const x = tryPlace(I.beachL * 0.7, W - I.beachR * 0.7, 18, 0.5) ?? placeAny(18);
     if (x == null) continue;
     add({ type: 'rock', key: 'r' + i, x, w: lerp(17, 26, rng()), h: lerp(11, 17, rng()), poly: rockPoly(rng, 13), moss: rng() });
   }
   // berry bushes
   for (let i = 0; i < (def.bushes || 0); i++) {
-    const x = tryPlace(I.beachL * 0.9, W - I.beachR * 0.9, 18, 0.55);
+    const x = tryPlace(I.beachL * 0.9, W - I.beachR * 0.9, 18, 0.55) ?? placeAny(18);
     if (x == null) continue;
     const blobs = [];
     const nb = 6 + Math.floor(rng() * 3);
@@ -435,7 +443,7 @@ function placeProps(I, def, rng) {
   }
   // one chest per island
   if (I.kind === 'normal') {
-    const x = tryPlace(I.beachL * 0.75, W - I.beachR * 0.75, 20, 0.35) || tryPlace(20, W - 20, 16, 0.6, 100);
+    const x = tryPlace(I.beachL * 0.75, W - I.beachR * 0.75, 20, 0.35) ?? tryPlace(20, W - 20, 16, 0.6, 100) ?? placeAny(14);
     if (x != null) { const sx = x - L; I.chest = add({ type: 'chest', key: 'c', x, tilt: (rng() - 0.5) * 0.16, sunk: lerp(2, 4, rng()), onSand: sx < I.beachL * 1.05 || sx > W - I.beachR * 1.05 }); }
   }
   for (const p of P) {
@@ -550,6 +558,155 @@ function placeProps(I, def, rng) {
   I.crabZones = [[L + 8, L + I.beachL * 0.95], [L + W - I.beachR * 0.95, L + W - 8]];
   I.nCrabs = def.crabs || 2;
   I.crabSeed = I.seed * 31 + 7;
+
+  buildSilhouette(I);
+  buildFarFacets(I);
+  buildUnderground(I);
+}
+
+// ---- the far silhouette seen across the sea while the island is still ahead: two height
+// profiles above sea level (terrain + tree crowns, and the higher far ridge behind) + palms
+const SIL_N = 96;
+function buildSilhouette(I) {
+  if (I.kind === 'lighthouse') return;          // sky.js paints the far lighthouse itself
+  const L = I.shoreL, W = I.W, far = I.far;
+  const x0 = L - 16, x1 = L + W + 16;
+  const farAt = (x) => {
+    if (far.length < 2 || x <= far[0][0] || x >= far[far.length - 1][0]) return 0;
+    const f = (x - far[0][0]) / (far[1][0] - far[0][0]);
+    const k = Math.min(far.length - 2, Math.floor(f));
+    return -lerp(far[k][1], far[k + 1][1], f - k);
+  };
+  const T = new Float32Array(SIL_N + 1), R = new Float32Array(SIL_N + 1);
+  let maxR = 1;
+  for (let k = 0; k <= SIL_N; k++) {
+    const x = lerp(x0, x1, k / SIL_N);
+    let h = Math.max(0, -gy(I, x));
+    for (const t of I.trees) {
+      if (t.type === 'palm') continue;              // palms are stroked separately
+      const baseH = -t.base;
+      let cx = t.x, top, cw;
+      if (t.type === 'broad') { cx = t.x + t.lean * t.h * 0.4; top = baseH + t.h * 1.06; cw = t.h * 0.5; }
+      else if (t.type === 'dead') { top = baseH + t.h * 0.8; cw = t.h * 0.3; }
+      else { top = baseH + t.h * 0.95; cw = t.h * 0.65; }
+      const d = (x - cx) / cw;
+      if (d <= -1 || d >= 1) continue;
+      h = Math.max(h, top - cw * 0.7 * (1 - Math.sqrt(1 - d * d)));
+    }
+    const ground = Math.max(0, -gy(I, x));
+    if (h > ground + 8) h += (noise1(x * 0.21, I.seed + 77) - 0.5) * 6;      // leafy, not cloud-smooth
+    T[k] = h;
+    R[k] = Math.max(h, farAt(x));
+    maxR = Math.max(maxR, R[k]);
+  }
+  I.silT = T; I.silR = R; I.silX0 = x0; I.silX1 = x1; I.silMax = maxR;
+  I.silPalms = [];
+  for (const p of I.props) if (p.type === 'palm') I.silPalms.push({ x: p.x, b: -p.y, tx: p.x + p.lean * p.h, th: -p.y + p.h - 2, s: p.h / 110 });
+  for (const t of I.trees) if (t.type === 'palm') I.silPalms.push({ x: t.x, b: -t.base, tx: t.x + t.lean * t.h, th: -t.base + t.h, s: t.h / 110 });
+}
+
+// ---- crests, gullies and ledges for the painterly far ridge (drawFar)
+function buildFarFacets(I) {
+  const far = I.far;
+  const F = I.farFacets = [];
+  if (far.length < 8) return;
+  const rng = seeded(I.seed * 53 + 9);
+  const rocky = I.theme === 'rocky';
+  const H = (k) => -far[k][1];
+  const crest = (k, side, steepK) => {
+    let x = far[k][0], y = far[k][1];
+    const pts = [[x, y]];
+    for (let j = 0; j < 7 && y < -10; j++) {
+      x += side * lerp(6, 16, rng());
+      y += lerp(12, 26, rng()) * steepK;
+      pts.push([x + (rng() - 0.5) * 5, Math.min(y, -6)]);
+    }
+    if (pts.length > 2) F.push({ pts, side, wide: lerp(10, 20, rng()) * (rocky ? 1.2 : 1) });
+  };
+  const peaks = [];
+  for (let k = 2; k < far.length - 2; k++) {
+    if (H(k) > H(k - 1) && H(k) >= H(k + 1) && H(k) > H(k - 2) && H(k) >= H(k + 2) && H(k) > 30) peaks.push(k);
+  }
+  peaks.sort((a, b) => H(b) - H(a));
+  peaks.length = Math.min(peaks.length, rocky ? 5 : 3);
+  for (const k of peaks) { crest(k, -1, 1); crest(k, 1, 1); }
+  // gullies running down from the skyline
+  const ng = rocky ? 9 : 4;
+  for (let j = 0; j < ng; j++) {
+    const k = 3 + Math.floor(rng() * (far.length - 6));
+    if (H(k) < 50) continue;
+    crest(k, rng() < 0.5 ? -1 : 1, rocky ? 1.5 : 1.3);
+  }
+  if (rocky) {
+    // layered stone: short broken ledges with a shadow under each
+    for (let j = 0; j < 7; j++) {
+      const k = 3 + Math.floor(rng() * (far.length - 6));
+      const x = far[k][0], hh = H(k);
+      if (hh < 60) continue;
+      const y = -hh * lerp(0.3, 0.72, rng()), w = lerp(14, 30, rng()), tilt = (rng() - 0.5) * 7;
+      const pts = [];
+      for (let i = 0; i <= 4; i++) { const u = i / 4; pts.push([x - w + 2 * w * u, y + tilt * (u - 0.5) * 2 - Math.sin(u * Math.PI) * lerp(1, 3, rng())]); }
+      F.push({ pts, ledge: true, drop: lerp(3, 6, rng()) });
+    }
+  }
+}
+
+// ---- the underground cross-section: finger roots and something big buried in the strata
+function buildUnderground(I) {
+  const rng = seeded(I.seed * 101 + 17);
+  const L = I.shoreL, W = I.W;
+  const roots = I.roots = [];
+  const hosts = [];
+  for (const t of I.trees) if (t.type !== 'shrub' && -gy(I, t.x) > 6) hosts.push(t.x);
+  for (const p of I.props) if (p.type === 'palm' || p.type === 'bush') hosts.push(p.x);
+  hosts.sort((a, b) => a - b);
+  let lastX = -1e9;
+  for (const hx of hosts) {
+    if (hx - lastX < 24 || rng() < 0.2) continue;
+    lastX = hx;
+    const n = 1 + (rng() < 0.55 ? 1 : 0) + (rng() < 0.2 ? 1 : 0);
+    for (let j = 0; j < n; j++) {
+      const x = hx + (rng() - 0.5) * 12;
+      const tap = rng() < 0.4;                        // the long ones reach far down
+      let a = Math.PI / 2 + (rng() - 0.5) * (tap ? 0.7 : 1.4);
+      let px = x, py = gy(I, x) + 1.5;
+      const segs = tap ? 5 + Math.floor(rng() * 2) : 3 + Math.floor(rng() * 2);
+      const w0 = tap ? lerp(2.8, 3.8, rng()) : lerp(1.8, 2.8, rng());
+      const pts = [[px, py, w0]];
+      const curl = rng() < 0.5 ? -1 : 1;
+      for (let k = 0; k < segs; k++) {
+        const len = (tap ? lerp(13, 21, rng()) : lerp(8, 14, rng())) * (1 - k * 0.07);
+        a += (rng() - 0.5) * 0.55 + (k >= segs - 2 ? curl * 0.55 : 0);     // the last joints curl like a finger
+        a = clamp(a, 0.25, Math.PI - 0.25);
+        px += Math.cos(a) * len; py += Math.sin(a) * len;
+        pts.push([px, py, w0 * Math.max(0.28, 1 - (k + 1) / (segs + 1.3))]);
+      }
+      const hairs = [];
+      for (let k = 0; k < 4; k++) hairs.push([1 + Math.floor(rng() * (pts.length - 1)), (rng() < 0.5 ? -1 : 1) * lerp(0.5, 1.2, rng()), lerp(4, 10, rng())]);
+      roots.push({ pts, hairs, nail: rng() < 0.35 });
+    }
+  }
+  // one big wrong thing per island, deep enough to sit below the land canvas fade
+  // (its depth follows the ground above, so it shows in the frame when the boy stands over it,
+  // and it never pokes out of a slope)
+  const kinds = ['ribs', 'eye', 'jaw', 'hand', 'ribs'];
+  const depthAt = (x, sc, depth) => {
+    let low = -1e9;
+    for (let d = -52 * sc; d <= 52 * sc; d += 4) low = Math.max(low, gy(I, x + d));
+    return Math.max(low + 42 * sc, gy(I, x) + depth);
+  };
+  I.buried = [];
+  if (I.kind !== 'lighthouse') {
+    const type = kinds[I.idx % kinds.length];
+    const x = L + lerp(Math.max(I.beachL + 50, W * 0.3), Math.min(W - I.beachR - 50, W * 0.7), rng());
+    const sc = lerp(1.15, 1.35, rng());
+    I.buried.push({ type, x, y: depthAt(x, sc, lerp(76, 88, rng())), s: sc, flip: rng() < 0.5 ? -1 : 1, rot: (rng() - 0.5) * 0.3 });
+    // the forest island hides an eye as well
+    if (I.theme === 'forest') { const ex = L + W * lerp(0.15, 0.25, rng()); I.buried.push({ type: 'eye', x: ex, y: depthAt(ex, 0.9, lerp(48, 60, rng())), s: 0.9, flip: 1, rot: (rng() - 0.5) * 0.2 }); }
+  }
+  // small bones and teeth scattered through the earth
+  I.bones = [];
+  for (let k = 0; k < Math.round(W / 70); k++) { const x = L + lerp(20, W - 20, rng()); I.bones.push({ x, y: Math.max(gy(I, x) + lerp(16, 130, rng()), 6), len: lerp(4, 9, rng()), a: rng() * Math.PI, tooth: rng() < 0.35 }); }
 }
 
 // Irregular rock outline: points on a unit half-ellipse (y ≤ 0 is up), flattened base.
@@ -660,6 +817,21 @@ function lanternLit(G) {
   const P = G.player;
   if (P && P.lantern === true) return true;
   return !!(G.inv && G.inv.lantern > 0 && isNight(G));
+}
+
+// A lit lamp on the raft (raft.js publishes its flame position) within r of (x, y)?
+const LAMP_R = 120;
+function raftLampNear(G, x, y, r = LAMP_R) {
+  const lp = G.raft && G.raft.lampPos;
+  if (!lp || !Number.isFinite(lp.x) || !Number.isFinite(lp.y)) return false;
+  return Math.hypot(lp.x - x, lp.y - y) < r;
+}
+
+// Light the beast fears: the boy's lantern, or a lit raft lamp near the boy or near the beast.
+function beastLit(G, B) {
+  const P = G.player;
+  if (lanternLit(G)) return true;
+  return (P && raftLampNear(G, P.x, P.y - 14)) || raftLampNear(G, B.x, B.y - 40);
 }
 
 // =====================================================================================
@@ -773,16 +945,17 @@ export function update(G, dt) {
     const on = lampOn(G);
     if (on > 0.02 && d < 1500) {
       const k = beamK(G, d);
-      addLight(G, lamp.x, lamp.y, 110, [255, 220, 150], 0.95 * on * (1 - smoothstep(900, 1500, d)));
-      const th = G.time * 0.9;
-      for (const sgn of [1, -1]) {
-        const c = Math.cos(th) * sgn;
-        if (c < 0.15) continue;
-        const len = 1600 * c;
-        for (let j = 1; j <= 4; j++) {
-          const bx = lamp.x + sgn * len * j / 4.4, by = lamp.y + len * j / 4.4 * 0.05;
-          if (!onScreen(G, bx, by, 160)) continue;
-          addLight(G, bx, by, 70 + 25 * j, [255, 226, 170], 0.32 * k * c * (1 - j * 0.15));
+      addLight(G, lamp.x, lamp.y, 120, [255, 204, 136], 0.95 * on * (1 - smoothstep(900, 1500, d)));
+      // warm pools along both beams so the darkness pass keeps them golden instead of grey
+      const bm = beamGeom(G);
+      if (bm.c > 0.06 && k > 0.02) {
+        for (const dir of [1, -1]) {
+          for (let j = 1; j <= 8; j++) {
+            const u = j / 9;
+            const bx = lamp.x + dir * bm.len * u, by = lamp.y + BEAM_DROP * bm.len * u;
+            if (!onScreen(G, bx, by, 200)) continue;
+            addLight(G, bx, by, 30 + bm.half * (0.6 + 1.1 * u), [255, 184, 100], 0.55 * k * bm.inten * Math.pow(1 - u, 0.6));
+          }
         }
       }
     }
@@ -819,7 +992,7 @@ function harvest(G, I, p) {
     play('pickup');
   } else if (p.type === 'rock') {
     a.hit = 1;
-    give(G, 'stone', 1 + (Math.random() < 0.5 ? 1 : 0));
+    give(G, 'stone', 2 + (Math.random() < 0.5 ? 1 : 0));    // 2–3: the grill needs two
     G.shake = (G.shake || 0) + 0.12;
     for (let k = 0; k < 12; k++) emit(G, { x: p.x + rnd(-6, 6), y: p.y - p.h * 0.6, vx: rnd(-55, 55), vy: rnd(-90, -30), life: rnd(0.5, 1), size: rnd(0.9, 2), color: [150, 146, 136], alpha: 0.95, gravity: 420, drag: 0.6 });
     play('hammer');
@@ -849,7 +1022,7 @@ function openChest(G, I, p) {
   for (const id in loot) { give(G, id, loot[id], true); parts.push(itemName(id) + '×' + loot[id]); }
   say(G, '箱子里有：' + parts.join('、'), 'pickup');
   journal(G, PAGES[Math.min(I.idx, PAGES.length - 1)]);
-  say(G, '箱底压着一页旧日记……（按 J 查看）', 'story');
+  say(G, hint('箱底压着一页旧日记……（按 J 查看）', '箱底压着一页旧日记……（点「图鉴」查看）'), 'story');
   for (let k = 0; k < 14; k++) emit(G, { x: p.x + rnd(-7, 7), y: p.y - 9, vx: rnd(-12, 12), vy: rnd(-34, -12), life: rnd(1, 2), size: rnd(1, 2.4), color: [255, 214, 150], alpha: 0.7, kind: 'glow', drag: 1.5, water: 'above' });
   play('pickup', { volume: 0.9 });
   const P = G.player;
@@ -860,6 +1033,8 @@ function openDoor(G, I) {
   if (isNight(G)) { say(G, '门锁着……等天亮再来吧。'); play('ui'); return; }
   journal(G, '推开了灯塔沉重的木门。石阶一圈一圈地盘上去，一直通到光里。');
   play('ui');
+  const fl = G.persist.flags || (G.persist.flags = {});
+  fl.finished = 1;
   G.mode = 'ending';
 }
 
@@ -1014,7 +1189,7 @@ function updateBeast(G, rt, B, dt, bi, night) {
   const [a, b] = beastRange(I, B.x);
   const reach = bi === B.isl && P.x >= a - 8 && P.x <= b + 8 && !P.dead && G.mode === 'play';
   const dx = P.x - B.x, dist = Math.abs(dx);
-  const lamp = lanternLit(G);
+  const lamp = beastLit(G, B);
   B.chargeCD -= dt; B.braveT -= dt; B.hitT -= dt;
 
   if (!active && B.st !== 'retreat') setState(B, 'retreat');
@@ -1023,14 +1198,16 @@ function updateBeast(G, rt, B, dt, bi, night) {
   let targetV = 0, accel = 260;
   let crouch = 0.3, lean = 0, jaw = 0, tilt = 0, reachK = 0;
   const face = () => { if (dist > 3) B.f = dx > 0 ? 1 : -1; };
-  // the lantern: hesitate and keep away for a few seconds at a time
-  const canFear = lamp && reach && dist < 120 && B.braveT <= 0 && (B.st === 'stalk' || B.st === 'windup' || B.st === 'recover');
+  // the lantern (or a lit raft lamp): hesitate and keep away for a few seconds at a time.
+  // Checked at 170, before the windup can start (stalk winds up inside 150), so the light
+  // stops the first charge instead of only the ones after it.
+  const canFear = lamp && reach && dist < 170 && B.braveT <= 0 && (B.st === 'stalk' || B.st === 'windup' || B.st === 'recover');
   if (canFear) {
     setState(B, 'hesitate');
     B.hesT = rnd(3, 4.5);
     play('beast', { volume: 0.45, x: B.x });
     const fl = G.persist.flags || (G.persist.flags = {});
-    if (!fl.beastLight) { fl.beastLight = 1; say(G, '它怕提灯的光……', 'info'); }
+    if (!fl.beastLight) { fl.beastLight = 1; say(G, lanternLit(G) ? '它怕提灯的光……' : '它怕灯光……', 'info'); }
   }
 
   switch (B.st) {
@@ -1090,13 +1267,14 @@ function updateBeast(G, rt, B, dt, bi, night) {
     case 'hesitate': {
       face();
       B.hesT -= dt;
-      const want = 74;
-      if (dist < want) targetV = -B.f * 55; else if (dist > want + 26) targetV = B.f * 14; else targetV = 0;
+      const want = 96;
+      if (dist < want) targetV = -B.f * 55; else if (dist > want + 30) targetV = B.f * 14; else targetV = 0;
       accel = 300; crouch = 0.55; lean = -0.5; tilt = -0.3;
       if (B.hesT <= 0 || !lamp || !reach) {
-        if (B.hesT <= 0) B.braveT = rnd(2.5, 4);
+        if (B.hesT <= 0) B.braveT = rnd(2, 3.2);
         setState(B, reach ? 'stalk' : 'shore');
-        B.chargeCD = Math.min(B.chargeCD, 0.5);
+        // the light bought real time: no instant re-charge the moment it gathers its nerve
+        B.chargeCD = Math.max(B.chargeCD, 1.5);
       }
       break;
     }
@@ -1113,7 +1291,10 @@ function updateBeast(G, rt, B, dt, bi, night) {
       face();
       // pace up and down the edge of the dry land nearest the boy, staring at him
       const sway = 14 + Math.sin(B.stT * 0.7) * 14;
-      const goal = P.x < a ? a + sway : P.x > b ? b - sway : clamp(P.x, a, b);
+      let goal = P.x < a ? a + sway : P.x > b ? b - sway : clamp(P.x, a, b);
+      // a lit lamp on the raft keeps it back from the water's edge
+      const lp = G.raft && G.raft.lampPos;
+      if (lp && Number.isFinite(lp.x) && Math.abs(goal - lp.x) < LAMP_R - 5) goal = clamp(lp.x + (B.x >= lp.x ? 1 : -1) * (LAMP_R - 5), a, b);
       const dd = goal - B.x;
       targetV = Math.abs(dd) > 4 ? sign(dd) * Math.min(42, Math.abs(dd) * 2) : 0;
       accel = 160;
@@ -1339,7 +1520,37 @@ export function debugSpawn(G, kind) {
 
 const CACHE = new Map();   // island index → { land:[day,night], back:[day,night], under, deep, tower:[day,night] }
 
-function cacheOf(I) { let c = CACHE.get(I.idx); if (!c) { c = { land: [null, null], back: [null, null], under: null, deep: null, tower: [null, null], far: false }; CACHE.set(I.idx, c); } return c; }
+function cacheOf(I) { let c = CACHE.get(I.idx); if (!c) { c = { land: [null, null], back: [null, null], under: null, deep: null, tower: [null, null], far: false, gold: { land: null, back: null } }; CACHE.set(I.idx, c); } return c; }
+
+// Golden-hour copies of the day land/back pieces: multiplied (and soft-lit) by the warm
+// horizon colour, alpha kept from the source. Rebuilt only when the colour drifts.
+let GOLD_BUDGET = 0;
+function goldPiece(I, k, col) {
+  if (!col || typeof document === 'undefined') return null;
+  const c = cacheOf(I);
+  const src = piece(I, k, 0);
+  if (!src) return null;
+  const old = c.gold[k];
+  const fresh = old && old.src === src && Math.abs(old.col[0] - col[0]) + Math.abs(old.col[1] - col[1]) + Math.abs(old.col[2] - col[2]) < 9;
+  if (fresh || (old && old.src === src && GOLD_BUDGET <= 0)) return old;
+  GOLD_BUDGET--;
+  try { c.gold[k] = tintSurface(src, col, old); } catch (e) { oops('golden ' + k, e); c.gold[k] = null; }
+  return c.gold[k];
+}
+function tintSurface(src, col, old) {
+  const W = src.cv.width, H = src.cv.height;
+  const cv = old && old.cv.width === W && old.cv.height === H ? old.cv : makeCanvas(W, H);
+  const g = cv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 1;
+  g.globalCompositeOperation = 'copy'; g.drawImage(src.cv, 0, 0);
+  g.globalCompositeOperation = 'multiply'; g.fillStyle = rgb(col); g.fillRect(0, 0, W, H);
+  g.globalCompositeOperation = 'soft-light'; g.globalAlpha = 0.5; g.fillStyle = rgb(mixColor(col, [255, 170, 90], 0.25)); g.fillRect(0, 0, W, H);
+  g.globalAlpha = 1;
+  g.globalCompositeOperation = 'destination-in'; g.drawImage(src.cv, 0, 0);
+  g.globalCompositeOperation = 'source-over';
+  return { cv, X0: src.X0, Y0: src.Y0, X1: src.X1, Y1: src.Y1, res: src.res, src, col: col.slice() };
+}
 
 // Build missing pieces for nearby islands (one piece per call when not urgent).
 function manageCaches(G, camX) {
@@ -1354,7 +1565,7 @@ function manageCaches(G, camX) {
     const need = [];
     if (wN < 0.999) need.push(['land', 0], ['back', 0]);
     if (wN > 0.001 || nightK(G) > 0.2) need.push(['land', 1], ['back', 1]);
-    need.push(['under', -1]);
+    need.push(['under', -1], ['deep', -1]);
     if (I.kind === 'lighthouse') need.push(['tower', 0], ['tower', 1]);
     for (const [k, vi] of need) {
       if (budget <= 0) return;
@@ -1369,9 +1580,12 @@ function buildPiece(I, c, k, vi) {
   try {
     if (k === 'land') c.land[vi] = renderLand(I, vi === 1);
     else if (k === 'back') c.back[vi] = renderBack(I, vi === 1);
-    else if (k === 'under') { c.under = renderUnder(I, UNDER_TOP, UNDER_SPLIT + 24, RES_UNDER); c.deep = I.maxD > UNDER_SPLIT ? renderUnder(I, UNDER_SPLIT, I.maxD + 14, RES_DEEP) : null; }
+    else if (k === 'under') c.under = renderUnder(I, UNDER_TOP, UNDER_SPLIT + 24, RES_UNDER);
+    // (the deep reef is its own piece so the two bakes land on different frames; a shallow
+    // island without one stores a placeholder that piece() reports as null)
+    else if (k === 'deep') c.deep = I.maxD > UNDER_SPLIT ? renderUnder(I, UNDER_SPLIT, I.maxD + 14, RES_DEEP) : { failed: true };
     else if (k === 'tower') c.tower[vi] = renderTower(I, vi === 1);
-  } catch (e) { oops('render ' + k, e); if (k === 'under') c.under = { failed: true }; else c[k][vi] = { failed: true }; }
+  } catch (e) { oops('render ' + k, e); if (vi < 0) c[k] = { failed: true }; else c[k][vi] = { failed: true }; }
 }
 
 function piece(I, k, vi) {
@@ -1447,6 +1661,10 @@ function renderLand(I, night) {
   g.fillStyle = rgb(P.core); g.fill();
   g.save();
   g.clip();
+  // sediment bands through the whole cross-section (shared with the reef canvas below)
+  strataBands(g, I, X0, X1, Y0, Y1, { dark: rgba(P.strata, 0.2), light: rgba(P.soil, 0.1), line: rgba(P.strata, 0.55), lineL: null });
+  for (const b of I.bones || []) drawBone(g, b, night);
+  for (const b of I.buried || []) drawBuried(g, b, night, rgba(mixColor(P.core, P.soil, 0.3), 0.62));
   const layer = (d0, d1, col, a) => {
     g.beginPath(); g.moveTo(xs[0], G_(xs[0]) + d0(xs[0]));
     for (let i = 1; i < xs.length; i++) g.lineTo(xs[i], G_(xs[i]) + d0(xs[i]));
@@ -1485,6 +1703,9 @@ function renderLand(I, night) {
     for (let j = 0; j < 4; j++) { const nx = px + (rng() - 0.5) * 8, ny = py + lerp(3, 6, rng()); g.quadraticCurveTo(px + (rng() - 0.5) * 6, (py + ny) / 2, nx, ny); px = nx; py = ny; }
     g.stroke();
   }
+  // pebbles all the way down, and the long knuckled roots of the trees
+  pebbles(g, I, X0, X1, Y1, seeded(I.seed * 61 + 3), (X1 - X0) * 0.22, P.core, P.rock, P.rockLit);
+  drawRoots(g, I, { body: rgb(mixColor(P.core, P.soil, 0.55)), dark: rgba(P.strata, 0.85), light: rgba(mixColor(P.soil, P.sandLit, 0.35), 0.5), nail: rgba(mixColor(P.soil, P.sandLit, 0.6), 0.75) });
   // sand body on the beaches and the shelf
   const sandT = (x) => (3 + 14 * beachW(x)) * (0.75 + 0.5 * noise1(x * 0.05, I.seed + 7));
   layer((x) => -1, (x) => sandT(x) + 5, P.sandDeep, 0.55);
@@ -1972,6 +2193,245 @@ function frondShape(g, x, y, a, len, droop, n) {
   return [tipX, tipY, cx, cy];
 }
 
+// ------------------------------------------------------------------ the cross-section
+// Sediment bands: roughly level, bending a third of the way with the ground above them.
+function strataBands(g, I, X0, X1, Y0, Y1, C, step = 4) {
+  const seed = I.seed;
+  const gref = -I.maxH * 0.5;
+  const xs = [];
+  for (let x = X0; x <= X1 + 0.1; x += step) xs.push(x);
+  const gys = xs.map((x) => gy(I, x));
+  const rows = new Map();               // band boundary k → its y for every column (computed once)
+  const row = (k) => {
+    let r = rows.get(k);
+    if (!r) {
+      r = new Float32Array(xs.length);
+      for (let i = 0; i < xs.length; i++) r[i] = 14 + k * 23 + (gys[i] - gref) * 0.32 + (fbm1(xs[i] * 0.006, 2, seed + k * 7) - 0.5) * 24 + (noise1(xs[i] * 0.07, seed + k * 3) - 0.5) * 2.4;
+      rows.set(k, r);
+      rows.delete(k - 2);
+    }
+    return r;
+  };
+  const yb = (k, i) => row(k)[i];
+  for (let k = -8; k < 90; k++) {
+    let lo = 1e9, hi = -1e9;
+    for (let i = 0; i < xs.length; i += 6) { const y = yb(k, i); if (y < lo) lo = y; if (y > hi) hi = y; }
+    if (lo > Y1 + 20) break;
+    if (hi + 52 < Y0) continue;                   // the whole band lies above this canvas
+    const kind = ((k % 3) + 3) % 3;
+    if (kind !== 1) {
+      g.beginPath();
+      for (let i = 0; i < xs.length; i++) { const y = yb(k, i); i ? g.lineTo(xs[i], y) : g.moveTo(xs[i], y); }
+      for (let i = xs.length - 1; i >= 0; i--) g.lineTo(xs[i], yb(k + 1, i) - 0.5);
+      g.closePath();
+      g.fillStyle = kind === 0 ? C.dark : C.light;
+      g.fill();
+    }
+    g.beginPath();
+    for (let i = 0; i < xs.length; i++) { const y = yb(k, i); i ? g.lineTo(xs[i], y) : g.moveTo(xs[i], y); }
+    g.strokeStyle = C.line; g.lineWidth = 0.7; g.stroke();
+    if (C.lineL) {
+      g.beginPath();
+      for (let i = 0; i < xs.length; i++) { const y = yb(k, i) + 1.1; i ? g.lineTo(xs[i], y) : g.moveTo(xs[i], y); }
+      g.strokeStyle = C.lineL; g.lineWidth = 0.5; g.stroke();
+    }
+  }
+}
+
+// Pebbles bedded in the earth (only below the ground line; the caller's clip does the rest).
+function pebbles(g, I, X0, X1, Y1, rng, n, core, rock, lit) {
+  for (let k = 0; k < n; k++) {
+    const x = lerp(X0, X1, rng());
+    const top = gy(I, x) + 3;
+    const y = top + Math.pow(rng(), 0.8) * Math.max(0, Y1 + 10 - top);
+    const r = lerp(0.6, 2.6, Math.pow(rng(), 2));
+    const rot = (rng() - 0.5) * 1.2;
+    g.beginPath(); g.ellipse(x, y, r * 1.35, r, rot, 0, TAU);
+    g.fillStyle = rgba(mixColor(core, rock, 0.2 + rng() * 0.45), 0.85); g.fill();
+    if (r > 1.2) { g.beginPath(); g.ellipse(x - r * 0.25, y - r * 0.38, r * 0.7, r * 0.3, rot, 0, TAU); g.fillStyle = rgba(lit, 0.13); g.fill(); }
+  }
+}
+
+// The tree roots: tapering, knuckled, the last joints curling like fingers.
+function drawRoots(g, I, C) {
+  for (const r of I.roots || []) {
+    const p = r.pts;
+    // thin hair roots first, behind the finger
+    g.strokeStyle = C.dark; g.lineWidth = 0.35;
+    g.beginPath();
+    for (const [k, side, len] of r.hairs) {
+      const a = p[k - 1], b = p[k];
+      const ang = Math.atan2(b[1] - a[1], b[0] - a[0]) + side;
+      g.moveTo(b[0], b[1]);
+      g.quadraticCurveTo(b[0] + Math.cos(ang) * len * 0.6, b[1] + Math.sin(ang) * len * 0.4, b[0] + Math.cos(ang + side * 0.6) * len, b[1] + Math.sin(ang + side * 0.6) * len);
+    }
+    g.stroke();
+    g.fillStyle = C.body;
+    for (let k = 0; k < p.length - 1; k++) seg(g, p[k][0], p[k][1], p[k + 1][0], p[k + 1][1], p[k][2] * 2, p[k + 1][2] * 2);
+    for (let k = 1; k < p.length - 1; k++) { g.beginPath(); g.ellipse(p[k][0], p[k][1], p[k][2] * 1.3, p[k][2] * 1.12, 0, 0, TAU); g.fill(); }
+    const e = p[p.length - 1];
+    g.beginPath(); g.arc(e[0], e[1], e[2], 0, TAU); g.fill();
+    // knuckle creases and a lit edge
+    g.strokeStyle = C.dark; g.lineWidth = 0.4;
+    g.beginPath();
+    for (let k = 1; k < p.length - 1; k++) {
+      const a = Math.atan2(p[k + 1][1] - p[k - 1][1], p[k + 1][0] - p[k - 1][0]) + Math.PI / 2, w = p[k][2] * 0.9;
+      for (const o of [-0.8, 0.8]) {
+        const cx = p[k][0] + Math.cos(a - Math.PI / 2) * o, cy = p[k][1] + Math.sin(a - Math.PI / 2) * o;
+        g.moveTo(cx - Math.cos(a) * w, cy - Math.sin(a) * w); g.lineTo(cx + Math.cos(a) * w, cy + Math.sin(a) * w);
+      }
+    }
+    g.stroke();
+    g.strokeStyle = C.light; g.lineWidth = 0.45;
+    g.beginPath();
+    for (let k = 0; k < p.length; k++) { const w = p[k][2] * 0.55; k ? g.lineTo(p[k][0] - w, p[k][1] - w * 0.3) : g.moveTo(p[k][0] - w, p[k][1] - w * 0.3); }
+    g.stroke();
+    if (r.nail) {
+      const a = Math.atan2(e[1] - p[p.length - 2][1], e[0] - p[p.length - 2][0]);
+      g.save(); g.translate(e[0], e[1]); g.rotate(a);
+      g.beginPath(); g.ellipse(-e[2] * 0.6, 0, e[2] * 1.1, e[2] * 0.75, 0, 0, TAU);
+      g.fillStyle = C.nail; g.fill();
+      g.restore();
+    }
+  }
+}
+
+function drawBone(g, b, night) {
+  g.save(); g.translate(b.x, b.y); g.rotate(b.a);
+  const col = night ? 'rgba(76,82,104,0.55)' : 'rgba(156,148,126,0.5)';
+  if (b.tooth) {
+    g.beginPath(); g.moveTo(-1.2, 0); g.quadraticCurveTo(-1, -b.len * 0.8, 0, -b.len); g.quadraticCurveTo(1, -b.len * 0.8, 1.2, 0); g.closePath();
+    g.fillStyle = col; g.fill();
+  } else {
+    g.strokeStyle = col; g.lineWidth = 1.3;
+    g.beginPath(); g.moveTo(-b.len / 2, 0); g.lineTo(b.len / 2, 0); g.stroke();
+    g.fillStyle = col;
+    for (const sx of [-b.len / 2, b.len / 2]) { g.beginPath(); g.arc(sx, -0.7, 1, 0, TAU); g.arc(sx, 0.7, 1, 0, TAU); g.fill(); }
+  }
+  g.restore();
+}
+
+// Something big and wrong, bedded in the strata. Local size is far larger than the boy (28).
+function drawBuried(g, b, night, veil) {
+  const bone = night ? 'rgba(66,72,94,0.7)' : 'rgba(132,126,106,0.66)', boneL = night ? 'rgba(150,162,196,0.16)' : 'rgba(206,198,172,0.2)', boneD = 'rgba(12,16,18,0.75)';
+  g.save();
+  g.translate(b.x, b.y); g.rotate(b.rot); g.scale(b.flip * b.s, b.s);
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  // the darker pocket the earth keeps around it
+  const pr = b.type === 'eye' ? 26 : 46;
+  const pg = g.createRadialGradient(0, 0, 0, 0, 0, pr);
+  pg.addColorStop(0, 'rgba(2,4,6,0.42)'); pg.addColorStop(0.6, 'rgba(2,4,6,0.18)'); pg.addColorStop(1, 'rgba(2,4,6,0)');
+  g.fillStyle = pg; g.beginPath(); g.ellipse(0, 0, pr * 1.35, pr * 0.85, 0, 0, TAU); g.fill();
+  const stroke2 = (w) => { g.strokeStyle = bone; g.lineWidth = w; g.stroke(); g.strokeStyle = boneL; g.lineWidth = w * 0.35; g.stroke(); };
+  if (b.type === 'ribs') {
+    // a spine and a cage of ribs, far longer than the boy is tall; two ribs snapped
+    const sp = (u) => [lerp(-44, 40, u), -14 - Math.sin(u * Math.PI) * 6];
+    g.beginPath(); for (let i = 0; i <= 24; i++) { const [x, y] = sp(i / 24); i ? g.lineTo(x, y) : g.moveTo(x, y); }
+    g.strokeStyle = bone; g.lineWidth = 3.6; g.stroke();
+    g.fillStyle = bone;
+    for (let i = 0; i <= 13; i++) { const [x, y] = sp(i / 13); g.beginPath(); g.ellipse(x, y - 0.6, 2.4, 3.2, 0, 0, TAU); g.fill(); g.beginPath(); g.moveTo(x - 1, y - 3); g.lineTo(x - 3.4, y - 7.5); g.lineTo(x + 0.6, y - 3); g.fill(); }
+    g.strokeStyle = boneD; g.lineWidth = 0.6;
+    g.beginPath(); for (let i = 0; i < 13; i++) { const [x, y] = sp((i + 0.5) / 13); g.moveTo(x, y - 3); g.lineTo(x, y + 2.4); } g.stroke();
+    for (let i = 0; i < 9; i++) {
+      const u = 0.12 + i * 0.092, [x, y] = sp(u);
+      const L = 26 + 14 * Math.sin(u * Math.PI);
+      const cut = i === 3 ? 0.55 : i === 6 ? 0.7 : 1;
+      const P0 = [x, y + 1.5], P1 = [x + 13, y + 3], P2 = [x + 17, y + L * 0.62], P3 = [x + 4 - i * 0.5, y + L];
+      const pts = [];
+      for (let j = 0; j <= 10 * cut; j++) pts.push(bez(P0[0], P0[1], P1[0], P1[1], P2[0], P2[1], P3[0], P3[1], j / 10));
+      g.fillStyle = bone;
+      for (let j = 0; j < pts.length - 1; j++) seg(g, pts[j][0], pts[j][1], pts[j + 1][0], pts[j + 1][1], lerp(3.6, 1.2, j / 10), lerp(3.6, 1.2, (j + 1) / 10));
+      g.strokeStyle = boneL; g.lineWidth = 0.6;
+      g.beginPath(); pts.forEach((p, j) => (j ? g.lineTo(p[0] - 0.7, p[1]) : g.moveTo(p[0] - 0.7, p[1]))); g.stroke();
+      if (cut < 1) { const e = pts[pts.length - 1]; g.fillStyle = boneD; g.beginPath(); g.moveTo(e[0] - 1.5, e[1]); g.lineTo(e[0] + 0.4, e[1] + 2.2); g.lineTo(e[0] + 1.6, e[1] - 0.3); g.fill(); }
+    }
+  } else if (b.type === 'eye') {
+    // an eye in the strata, wider than the boy's arm span; the layers fold around it like lids
+    g.beginPath(); g.moveTo(-15, 0); g.quadraticCurveTo(0, -10, 15, 0); g.quadraticCurveTo(0, 8.5, -15, 0); g.closePath();
+    const sg = g.createRadialGradient(0, 0, 1, 0, 0, 15);
+    sg.addColorStop(0, night ? 'rgba(112,118,136,0.9)' : 'rgba(200,192,166,0.9)'); sg.addColorStop(1, night ? 'rgba(40,44,58,0.85)' : 'rgba(96,92,80,0.85)');
+    g.fillStyle = sg; g.fill();
+    g.save(); g.clip();
+    g.strokeStyle = 'rgba(120,52,46,0.4)'; g.lineWidth = 0.35;
+    g.beginPath(); g.moveTo(-14, 0); g.quadraticCurveTo(-9, -1.5, -6, 0.5); g.moveTo(-13, 1.5); g.quadraticCurveTo(-9, 2.6, -6.5, 1.8); g.moveTo(14, 0.4); g.quadraticCurveTo(9.5, -1.4, 6.5, -0.2); g.stroke();
+    g.beginPath(); g.arc(1.5, 0.3, 5.6, 0, TAU); g.fillStyle = 'rgba(54,70,62,0.97)'; g.fill();
+    g.strokeStyle = 'rgba(120,140,112,0.45)'; g.lineWidth = 0.5; g.stroke();
+    g.beginPath(); g.ellipse(1.5, 0.3, 0.95, 4.4, 0, 0, TAU); g.fillStyle = 'rgb(4,5,6)'; g.fill();
+    g.beginPath(); g.arc(-0.4, -1.7, 1, 0, TAU); g.fillStyle = 'rgba(240,240,228,0.75)'; g.fill();
+    g.restore();
+    // lids made of the layers themselves
+    g.strokeStyle = 'rgba(6,8,10,0.7)'; g.lineWidth = 1.3;
+    g.beginPath(); g.moveTo(-17, 0.5); g.quadraticCurveTo(0, -12.5, 17, 0.5); g.moveTo(-16, 0.8); g.quadraticCurveTo(0, 10.5, 16, 0.8); g.stroke();
+    g.strokeStyle = 'rgba(150,140,118,0.16)'; g.lineWidth = 0.7;
+    g.beginPath(); g.moveTo(-22, 1); g.quadraticCurveTo(0, -17, 22, 1); g.moveTo(-21, 1.5); g.quadraticCurveTo(0, 15, 21, 1.5); g.stroke();
+    g.strokeStyle = 'rgba(6,8,10,0.6)'; g.lineWidth = 0.4;
+    g.beginPath(); for (let i = 0; i < 9; i++) { const u = (i + 0.5) / 9, x = lerp(-12, 12, u), y = -Math.sin(u * Math.PI) * 6.2; g.moveTo(x, y); g.lineTo(x + (u - 0.5) * 3, y - 2.6); } g.stroke();
+  } else if (b.type === 'jaw') {
+    // a lower jaw longer than the boy, the hinge hooked up at the back, too many thin teeth
+    g.beginPath();
+    g.moveTo(-35, -24);
+    g.quadraticCurveTo(-31, -29, -27, -24);
+    g.quadraticCurveTo(-28, -13, -21, -6);
+    g.lineTo(27, -4);
+    g.quadraticCurveTo(36, -3, 35, 2);
+    g.quadraticCurveTo(31, 9, 15, 9);
+    g.quadraticCurveTo(-12, 12, -30, 7);
+    g.quadraticCurveTo(-39, 3, -38, -8);
+    g.quadraticCurveTo(-37, -17, -35, -24);
+    g.closePath();
+    g.fillStyle = bone; g.fill();
+    g.strokeStyle = boneD; g.lineWidth = 0.6; g.stroke();
+    // the canal and the nerve holes, a lit underside
+    g.strokeStyle = boneD; g.lineWidth = 0.9;
+    g.beginPath(); g.moveTo(-30, -6); g.quadraticCurveTo(0, 3, 26, 1); g.stroke();
+    g.fillStyle = boneD;
+    for (const [hx, hy] of [[-6, 1.8], [8, 2.4], [20, 1.8]]) { g.beginPath(); g.ellipse(hx, hy, 1.1, 0.7, 0, 0, TAU); g.fill(); }
+    g.strokeStyle = boneL; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(-31, 5); g.quadraticCurveTo(-8, 10.5, 28, 6); g.stroke();
+    g.fillStyle = night ? 'rgba(92,100,124,0.75)' : 'rgba(176,166,138,0.75)';
+    g.beginPath();
+    for (let i = 0; i < 15; i++) {
+      if (i === 5 || i === 11) continue;                        // gaps where teeth fell out
+      const x = lerp(-18, 30, i / 14), h = (6 + ((i * 7) % 5) * 1.8) * (i === 8 ? 0.45 : 1), lean = ((i * 3) % 4 - 1.5) * 0.9 + 1.2;
+      g.moveTo(x - 1.1, -4.2); g.quadraticCurveTo(x - 0.7 + lean * 0.4, -4.2 - h * 0.6, x + lean, -4.2 - h); g.quadraticCurveTo(x + 0.7 + lean * 0.4, -4.2 - h * 0.6, x + 1.1, -4.2);
+    }
+    g.fill();
+  } else if (b.type === 'hand') {
+    // a hand reaching up toward the light from somewhere below, fingers too long
+    g.beginPath(); g.moveTo(-4, 64); g.quadraticCurveTo(-4, 46, -2.5, 31); g.moveTo(4, 64); g.quadraticCurveTo(5, 46, 3, 31);
+    stroke2(3.4);
+    g.fillStyle = bone;
+    for (const [cx, cy] of [[-4, 28], [0, 27], [4, 28], [-2, 24], [2.5, 24]]) { g.beginPath(); g.ellipse(cx, cy, 2.2, 1.8, 0, 0, TAU); g.fill(); }
+    const knuck = [[-13, 4], [-4.5, -1], [4.5, -1], [13, 4]];
+    for (const k of knuck) { g.beginPath(); g.moveTo(k[0] * 0.28, 23); g.lineTo(k[0], k[1]); stroke2(2.9); }
+    for (let i = 0; i < 4; i++) {
+      let [x, y] = knuck[i];
+      let a = -Math.PI / 2 + (i - 1.5) * 0.2;
+      const joints = [[x, y]];
+      for (let j = 0; j < 3; j++) {
+        const len = [15, 11, 8][j] * (i === 1 || i === 2 ? 1.18 : 1);
+        a += j === 2 ? 0.55 * (i < 2 ? -1 : 1) : 0.12 * (i - 1.5);
+        x += Math.cos(a) * len; y += Math.sin(a) * len;
+        joints.push([x, y]);
+      }
+      g.fillStyle = bone;
+      for (let j = 0; j < 3; j++) seg(g, joints[j][0], joints[j][1], joints[j + 1][0], joints[j + 1][1], 2.9 - j * 0.5, 2.4 - j * 0.6);
+      for (let j = 0; j < 3; j++) { g.beginPath(); g.ellipse(joints[j][0], joints[j][1], 2 - j * 0.3, 1.7 - j * 0.3, 0, 0, TAU); g.fill(); }
+      g.strokeStyle = boneL; g.lineWidth = 0.6;
+      g.beginPath(); joints.forEach((p, j) => (j ? g.lineTo(p[0] - 0.8, p[1]) : g.moveTo(p[0] - 0.8, p[1]))); g.stroke();
+    }
+    g.beginPath(); g.moveTo(-5, 25); g.lineTo(-17, 15); g.lineTo(-24, 6); g.lineTo(-27, -1); stroke2(2.6);
+  }
+  // the earth half-covers it again: veils of soil and the strata running through it
+  g.strokeStyle = veil || (night ? 'rgba(12,14,22,0.6)' : 'rgba(26,34,36,0.6)');
+  for (let i = 0; i < 5; i++) {
+    const y = -22 + i * 11 + (i % 2) * 3;
+    g.lineWidth = 2 + (i % 3) * 1.6;
+    g.beginPath(); g.moveTo(-50, y); g.bezierCurveTo(-18, y - 6 + i, 12, y + 6 - i, 52, y + (i % 2 ? -3 : 3)); g.stroke();
+  }
+  g.restore();
+}
+
 // ------------------------------------------------------------------ the reef (under water)
 function renderUnder(I, Y0, Y1, res) {
   const X0 = I.x0 - 4, X1 = I.x1 + 4;
@@ -1986,6 +2446,14 @@ function renderUnder(I, Y0, Y1, res) {
   g.lineTo(X1, Y1 + 4); g.lineTo(X0, Y1 + 4); g.closePath();
   g.fillStyle = rgb(mixColor(PDAY.core, PDAY.water, 0.5)); g.fill();
   g.save(); g.clip();
+  // the cross-section: sediment bands, pebbles, small bones, roots, and the thing in the dark
+  strataBands(g, I, X0, X1, Y0, Y1, { dark: 'rgba(4,6,8,0.2)', light: 'rgba(120,112,92,0.09)', line: 'rgba(6,8,10,0.5)', lineL: null }, res < 0.8 ? 9 : 5);
+  pebbles(g, I, X0, X1, Y1, seeded(I.seed * 67 + Math.round(Y0)), (X1 - X0) * (Y1 - Y0) / (res < 0.8 ? 2400 : 700), [22, 30, 32], [92, 98, 94], [170, 176, 166]);
+  if (Y0 < 140) {
+    for (const b of I.bones || []) drawBone(g, b);
+    drawRoots(g, I, { body: 'rgb(58,56,50)', dark: 'rgba(8,10,12,0.8)', light: 'rgba(150,146,128,0.35)', nail: 'rgba(170,164,140,0.6)' });
+    for (const b of I.buried || []) drawBuried(g, b);
+  }
   const band = (off, col) => {
     g.beginPath(); g.moveTo(xs[0], G_(xs[0]) + off(xs[0]));
     for (let i = 1; i < xs.length; i++) g.lineTo(xs[i], G_(xs[i]) + off(xs[i]));
@@ -2256,6 +2724,10 @@ export function drawBack(ctx, G) {
   const t = G.time;
   const FP = framePal(G);
   const wN = cacheNight(G);
+  const gw = FP.goldC ? FP.gk * (1 - wN) * (1 - wN) * 0.9 : 0;   // golden-hour tint over the cached land (never lifts the night)
+  GOLD_BUDGET = 2;
+  // islands still ahead: hazy silhouettes on the horizon, growing as they come near
+  try { drawFarIslands(ctx, G, FP); } catch (e) { oops('far islands', e); }
   for (const I of L) {
     if (I.x1 < left - 300 || I.x0 > right + 300) {
       if (I.kind === 'lighthouse') drawBeam(ctx, G, I, FP);
@@ -2264,30 +2736,34 @@ export function drawBack(ctx, G) {
     if (I.kind === 'lighthouse') drawBeam(ctx, G, I, FP);
     const asset = getAsset(I.kind === 'lighthouse' ? 'lighthouse' : 'island');
     const aboveVisible = v.top < 20;
-    // far hazy hills (parallax)
-    if (aboveVisible && !asset) drawFar(ctx, G, I, FP);
+    // the backdrop: optional painted art (hazy, behind everything playable) or the far hills
+    if (aboveVisible) {
+      if (asset) drawAssetBackdrop(ctx, G, I, asset, FP, wN);
+      else drawFar(ctx, G, I, FP);
+    }
     // the tree line
-    if (aboveVisible && !asset) {
+    if (aboveVisible) {
       const sway = Math.sin(t * 0.55 + I.seed) * 0.012 * (0.5 + windOf(G));
       ctx.save();
       // shear around sea level (y = 0) so the roots stay put while the crowns sway
       ctx.transform(1, 0, sway, 1, 0, 0);
       if (wN < 0.999) blit(ctx, piece(I, 'back', 0), 1);
       if (wN > 0.001) blit(ctx, piece(I, 'back', 1), wN);
+      if (gw > 0.01) blit(ctx, goldPiece(I, 'back', FP.goldC), gw);
       ctx.restore();
     }
     // the reef below
     if (v.top + v.h > UNDER_TOP) {
-      if (v.top + v.h > UNDER_SPLIT - 10) { const c = cacheOf(I); if (!c.under) piece(I, 'under', -1); if (c.deep && !c.deep.failed) blit(ctx, c.deep, 1); }
+      if (v.top + v.h > UNDER_SPLIT - 10) blit(ctx, piece(I, 'deep', -1), 1);
       blit(ctx, piece(I, 'under', -1), 1);
     }
     // the land
     if (v.top < LAND_BOTTOM) {
       if (wN < 0.999) blit(ctx, piece(I, 'land', 0), 1);
       if (wN > 0.001) blit(ctx, piece(I, 'land', 1), wN);
-      if (asset) drawAsset(ctx, G, I, asset, wN);
+      if (gw > 0.01) blit(ctx, goldPiece(I, 'land', FP.goldC), gw);
     }
-    if (I.kind === 'lighthouse' && !asset && v.top < 20) drawTower(ctx, G, I, FP, wN);
+    if (I.kind === 'lighthouse' && v.top < 20) drawTower(ctx, G, I, FP, wN);
     if (!aboveVisible && v.top > LAND_BOTTOM) continue;
     drawProps(ctx, G, I, FP, left, right);
   }
@@ -2295,37 +2771,203 @@ export function drawBack(ctx, G) {
 
 function windOf(G) { const w = G.weather && G.weather.wind; return Number.isFinite(w) ? clamp(Math.abs(w), 0, 1.5) : 0.3; }
 
-// Optional painted art (assets/island.*, assets/lighthouse.*): laid over the procedural
-// terrain, bottom edge on the sea surface; darkened toward night like the rest.
-function drawAsset(ctx, G, I, img, wN) {
-  if (!img || !img.width) return;
-  let x, y, w, h;
-  if (I.kind === 'lighthouse') { h = 520; w = h * img.width / img.height; x = I.towerX - w / 2; y = 14 - h; }
-  else { w = I.W * 1.12; h = w * img.height / img.width; x = I.cx - w / 2; y = 12 - h; }
-  ctx.drawImage(img, x, y, w, h);
-  if (wN > 0.01) {
-    // toward night: multiply the painting by itself (deeper, darker; transparent parts stay clear)
-    ctx.save();
-    ctx.globalAlpha = 0.7 * wN;
-    ctx.globalCompositeOperation = 'multiply';
-    ctx.drawImage(img, x, y, w, h);
-    ctx.restore();
+// Optional painted art (assets/island.*, assets/lighthouse.*): only ever a hazy backdrop
+// fitted to the island span, BEHIND the procedural tree line and terrain — the playable land
+// in front is always the procedural one. Its foot and edges dissolve into the haze.
+const HAZY = {};
+function hazyArt(name, img, col, a) {
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  if (!iw || !ih) return null;
+  const q = (v) => Math.round(v / 4) * 4;
+  const key = q(col[0]) + ',' + q(col[1]) + ',' + q(col[2]) + ',' + a.toFixed(2);
+  let e = HAZY[name];
+  if (e && e.img === img && e.key === key) return e.cv;
+  if (!e || e.img !== img) {
+    const sc = Math.min(1, 1024 / Math.max(iw, ih));
+    e = HAZY[name] = { img, cv: makeCanvas(iw * sc, ih * sc), key: '' };
   }
+  const W = e.cv.width, H = e.cv.height;
+  const g = e.cv.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 1;
+  g.globalCompositeOperation = 'copy'; g.drawImage(img, 0, 0, W, H);
+  g.globalCompositeOperation = 'source-atop'; g.fillStyle = rgba(col, a); g.fillRect(0, 0, W, H);
+  // dissolve the foot into the mist and soften the borders (also tames an opaque image)
+  g.globalCompositeOperation = 'destination-out';
+  const fg = g.createLinearGradient(0, H * 0.55, 0, H);
+  fg.addColorStop(0, 'rgba(0,0,0,0)'); fg.addColorStop(1, 'rgba(0,0,0,0.95)');
+  g.fillStyle = fg; g.fillRect(0, H * 0.55, W, H * 0.45 + 1);
+  for (const [x0, x1] of [[0, W * 0.1], [W, W * 0.9]]) {
+    const sg = g.createLinearGradient(x0, 0, x1, 0);
+    sg.addColorStop(0, 'rgba(0,0,0,1)'); sg.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = sg; g.fillRect(Math.min(x0, x1), 0, W * 0.1, H);
+  }
+  const tg = g.createLinearGradient(0, 0, 0, H * 0.1);
+  tg.addColorStop(0, 'rgba(0,0,0,1)'); tg.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = tg; g.fillRect(0, 0, W, H * 0.1);
+  g.globalCompositeOperation = 'source-over';
+  e.key = key;
+  return e.cv;
+}
+function drawAssetBackdrop(ctx, G, I, img, FP, wN) {
+  if (!img || !img.width) return;
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const hazeC = mixColor(FP.farC, [10, 14, 30], 0.5 * wN);
+  const cv = hazyArt(I.kind === 'lighthouse' ? 'lighthouse' : 'island', img, hazeC, lerp(0.34, 0.8, wN));
+  if (!cv) return;
+  // fitted to the island span, standing on the sea behind the tree line, a little parallax
+  // (the lighthouse painting sits right behind the real tower, a little shorter, so its own
+  // tower hides behind ours instead of standing beside it as a second one)
+  const lh = I.kind === 'lighthouse';
+  let w = I.W * 1.04, h = w * ih / iw;
+  const hMax = lh ? TOWER.h * 0.9 : Math.max(150, I.maxH * 2.4 + 110);
+  if (h > hMax) { h = hMax; w = h * iw / ih; }
+  const cx = lh ? I.towerX : I.cx;
+  const dx = clamp((G.cam.x - cx) * (lh ? 0.03 : 0.12), lh ? -20 : -110, lh ? 20 : 110);
+  ctx.save();
+  ctx.globalAlpha = 0.92;
+  ctx.drawImage(cv, cx - w / 2 + dx, 8 - h, w, h);
+  ctx.restore();
 }
 
+// The far ridge behind the tree line, painted: a lit flank toward the sun (or moon), a
+// shadowed one, soft crest strokes (ledges on the rocky island), a misty foot and a lit skyline.
 function drawFar(ctx, G, I, FP) {
   const pts = I.far;
   if (!pts.length) return;
   const camX = G.cam.x;
   const dx = clamp((camX - I.cx) * 0.1, -90, 90);
   const a = I.shoreL + I.beachL * 0.35, b = I.shoreR - I.beachR * 0.35;
-  ctx.beginPath();
-  ctx.moveTo(clamp(pts[0][0] + dx, a, b), 4);
-  for (const p of pts) ctx.lineTo(clamp(p[0] + dx, a, b), p[1]);
-  ctx.lineTo(clamp(pts[pts.length - 1][0] + dx, a, b), 4);
-  ctx.closePath();
+  const path = () => {
+    ctx.beginPath();
+    ctx.moveTo(clamp(pts[0][0] + dx, a, b), 4);
+    for (const p of pts) ctx.lineTo(clamp(p[0] + dx, a, b), p[1]);
+    ctx.lineTo(clamp(pts[pts.length - 1][0] + dx, a, b), 4);
+    ctx.closePath();
+  };
+  path();
   ctx.fillStyle = FP.far;
   ctx.fill();
+  if (!FP.farC) return;
+  const v = G.view;
+  let top = 0;
+  for (const p of pts) top = Math.min(top, p[1]);
+  const x0 = clamp(pts[0][0] + dx, a, b), x1 = clamp(pts[pts.length - 1][0] + dx, a, b);
+  const c = cel(G);
+  let ld = -1;
+  if (c && v) {
+    const lx = c.sunVisible ? c.sunX : c.moonVisible ? c.moonX : null;
+    if (Number.isFinite(lx)) ld = lx >= (I.cx + dx - camX) * v.scale + v.cssW / 2 ? 1 : -1;
+  }
+  const sky = c && Array.isArray(c.horizon) ? c.horizon : FP.hzC;
+  const lightC = mixColor(mixColor(FP.farC, sky, 0.55), [255, 248, 232], 0.14 * (1 - FP.n));
+  const shadeC = mixColor(FP.farC, [8, 12, 30], 0.4);
+  const rocky = I.theme === 'rocky';
+  ctx.save();
+  path(); ctx.clip();
+  const hg = ctx.createLinearGradient(ld < 0 ? x0 : x1, 0, ld < 0 ? x1 : x0, 0);
+  hg.addColorStop(0, rgba(lightC, 0.5)); hg.addColorStop(0.4, rgba(lightC, 0.1));
+  hg.addColorStop(0.55, rgba(shadeC, 0.1)); hg.addColorStop(1, rgba(shadeC, 0.55));
+  ctx.fillStyle = hg; ctx.fillRect(x0 - 2, top - 2, x1 - x0 + 4, -top + 8);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const X = (p) => p[0] + dx;
+  for (const f of I.farFacets || []) {
+    const n = f.pts.length;
+    if (f.ledge) {
+      // the shelf's shadow below it, a lit lip on top
+      ctx.beginPath();
+      f.pts.forEach((p, i) => (i ? ctx.lineTo(X(p), p[1]) : ctx.moveTo(X(p), p[1])));
+      for (let i = n - 1; i >= 0; i--) { const u = i / (n - 1); ctx.lineTo(X(f.pts[i]) - ld * 2, f.pts[i][1] + f.drop * Math.sin(u * Math.PI)); }
+      ctx.closePath();
+      ctx.fillStyle = rgba(shadeC, 0.4); ctx.fill();
+      ctx.beginPath();
+      f.pts.forEach((p, i) => (i ? ctx.lineTo(X(p), p[1]) : ctx.moveTo(X(p), p[1])));
+      ctx.strokeStyle = rgba(lightC, 0.32); ctx.lineWidth = 0.8; ctx.stroke();
+      continue;
+    }
+    // a shadowed plane on the side of the crest away from the light, widening downhill
+    ctx.beginPath();
+    f.pts.forEach((p, i) => (i ? ctx.lineTo(X(p), p[1]) : ctx.moveTo(X(p), p[1])));
+    for (let i = n - 1; i >= 0; i--) { const u = i / (n - 1); ctx.lineTo(X(f.pts[i]) - ld * f.wide * (0.15 + 0.85 * u), f.pts[i][1] + 4 * u); }
+    ctx.closePath();
+    ctx.fillStyle = rgba(shadeC, rocky ? 0.3 : 0.2); ctx.fill();
+    // and the lit edge of the crest
+    ctx.beginPath();
+    f.pts.forEach((p, i) => (i ? ctx.lineTo(X(p) + ld * 0.7, p[1]) : ctx.moveTo(X(p) + ld * 0.7, p[1])));
+    ctx.strokeStyle = rgba(lightC, rocky ? 0.42 : 0.3); ctx.lineWidth = 1.1; ctx.stroke();
+  }
+  const mg = ctx.createLinearGradient(0, top * 0.55, 0, 4);
+  mg.addColorStop(0, rgba(sky, 0)); mg.addColorStop(1, rgba(sky, 0.4 * (1 - 0.5 * FP.n)));
+  ctx.fillStyle = mg; ctx.fillRect(x0 - 2, top * 0.55, x1 - x0 + 4, -top * 0.55 + 6);
+  ctx.restore();
+  ctx.beginPath();
+  pts.forEach((p, i) => (i ? ctx.lineTo(clamp(p[0] + dx, a, b), p[1]) : ctx.moveTo(clamp(p[0] + dx, a, b), p[1])));
+  ctx.strokeStyle = rgba(lightC, 0.3); ctx.lineWidth = 0.9; ctx.stroke();
+}
+
+// Islands still ahead announce themselves: from ~2500 units beyond the right edge of the view
+// they stand on the horizon as hazy silhouettes, drifting in slowly (a far parallax plane) and
+// growing as they come near; they dissolve into the haze as the real island arrives.
+const SIL_FAR = 2500;
+function drawFarIslands(ctx, G, FP) {
+  const v = G.view;
+  if (!(v && v.top < -6) || !ISL || !G.cam || !FP.farC) return;
+  const camX = G.cam.x, hw = v.w / 2, right = v.left + v.w;
+  let sky = null;
+  for (const I of ISL) {
+    if (!I.silT) continue;
+    const e = I.shoreL - right;
+    if (e < -60 || e > SIL_FAR) continue;
+    const u = clamp(1 - e / SIL_FAR, 0, 1);                   // 0 = just visible … 1 = arriving
+    const al = smoothstep(0, 0.1, u) * smoothstep(-60, 380, e);
+    if (al < 0.01) continue;
+    if (!sky) { const c = cel(G); sky = c && Array.isArray(c.horizon) ? c.horizon : FP.hzC; }
+    const q = lerp(0.26, 0.6, Math.pow(u, 1.4));
+    const wS = (I.silX1 - I.silX0) * q;
+    const x0 = camX + hw * lerp(0.86, 0.62, u) - wS / 2;      // a far plane: it drifts in slowly
+    const haze = lerp(0.52, 0.22, u) * (1 - 0.55 * FP.n);   // at night: dark cut-outs on the horizon glow
+    const ridgeC = mixColor(FP.farC, sky, Math.min(0.92, haze + 0.15));
+    const landC = mixColor(FP.farC, sky, haze);
+    const N = SIL_N;
+    const fill = (arr, col, top) => {
+      ctx.beginPath();
+      ctx.moveTo(x0, 4);
+      for (let k = 0; k <= N; k++) ctx.lineTo(x0 + wS * k / N, -arr[k] * q);
+      ctx.lineTo(x0 + wS, 4);
+      ctx.closePath();
+      const gr = ctx.createLinearGradient(0, -top * q, 0, 4);
+      gr.addColorStop(0, rgb(col)); gr.addColorStop(1, rgb(mixColor(col, sky, 0.4)));
+      ctx.fillStyle = gr; ctx.fill();
+    };
+    ctx.save();
+    ctx.globalAlpha = al;
+    fill(I.silR, ridgeC, I.silMax);
+    fill(I.silT, landC, I.silMax * 0.8);
+    // palms: the shape that says "island" from far away
+    const px = (x) => x0 + (x - I.silX0) * q;
+    ctx.strokeStyle = rgb(landC); ctx.lineCap = 'round';
+    ctx.lineWidth = Math.max(0.6, 2.2 * q);
+    ctx.beginPath();
+    for (const p of I.silPalms) { ctx.moveTo(px(p.x), -p.b * q); ctx.quadraticCurveTo(px((p.x + p.tx) / 2), -(p.b + p.th) / 2 * q, px(p.tx), -p.th * q); }
+    ctx.stroke();
+    ctx.lineWidth = Math.max(0.5, 1.6 * q);
+    ctx.beginPath();
+    for (const p of I.silPalms) {
+      const tx = px(p.tx), ty = -p.th * q, L = 30 * q * p.s;
+      for (let k = 0; k < 7; k++) {
+        const ang = lerp(-Math.PI + 0.25, -0.25, k / 6);
+        const ex = tx + Math.cos(ang) * L, ey = ty + Math.sin(ang) * L * 0.5 + L * 0.42;
+        ctx.moveTo(tx, ty); ctx.quadraticCurveTo(tx + Math.cos(ang) * L * 0.55, ty + Math.sin(ang) * L * 0.6, ex, ey);
+      }
+    }
+    ctx.stroke();
+    // mist lying on the water at its foot
+    const mh = 26 * q + 6;
+    const mg = ctx.createLinearGradient(0, -mh, 0, 3);
+    mg.addColorStop(0, rgba(sky, 0)); mg.addColorStop(1, rgba(sky, 0.6));
+    ctx.fillStyle = mg; ctx.fillRect(x0 - 20, -mh, wS + 40, mh + 4);
+    ctx.restore();
+  }
 }
 
 // ------------------------------------------------------------------ per-frame props
@@ -2408,10 +3050,16 @@ function drawProps(ctx, G, I, FP, left, right) {
 let MIST = null;
 function mistSprite() {
   if (MIST || typeof document === 'undefined') return MIST;
+  // a radial gradient drawn in a vertically squashed space: centred there (48, 48 → 48, 24
+  // on the canvas), so it reaches zero on every edge — no hard top line
   const c = makeCanvas(96, 48), g = c.getContext('2d');
-  const gr = g.createRadialGradient(48, 24, 0, 48, 24, 48);
-  gr.addColorStop(0, 'rgba(214,226,246,1)'); gr.addColorStop(0.5, 'rgba(214,226,246,0.45)'); gr.addColorStop(1, 'rgba(214,226,246,0)');
-  g.setTransform(1, 0, 0, 0.5, 0, 12);
+  const gr = g.createRadialGradient(48, 48, 0, 48, 48, 48);
+  gr.addColorStop(0, 'rgba(214,226,246,1)');
+  gr.addColorStop(0.3, 'rgba(214,226,246,0.62)');
+  gr.addColorStop(0.6, 'rgba(214,226,246,0.22)');
+  gr.addColorStop(0.82, 'rgba(214,226,246,0.06)');
+  gr.addColorStop(1, 'rgba(214,226,246,0)');
+  g.setTransform(1, 0, 0, 0.5, 0, 0);
   g.fillStyle = gr; g.fillRect(0, 0, 96, 96);
   MIST = c;
   return c;
@@ -2749,6 +3397,37 @@ function drawTower(ctx, G, I, FP, wN) {
   ctx.restore();
 }
 
+// The beam: a double lens turning about the tower's axis, seen from the side — two cones
+// (left and right) whose projected length breathes with cos(angle), plus a flare when a lens
+// faces us. Drawn additively from a pre-feathered warm sprite in three nested passes.
+const BEAM_W = 256, BEAM_H = 128, BEAM_HW = 30, BEAM_DROP = 0.05;
+let BEAM = null;
+function beamSprite() {
+  if (BEAM || typeof document === 'undefined') return BEAM;
+  const c = makeCanvas(BEAM_W, BEAM_H), g = c.getContext('2d');
+  const cy = BEAM_H / 2;
+  // soft (roughly gaussian) profile across the cone: [position 0..1 across, alpha, colour]
+  const prof = [[0, 0, [255, 130, 50]], [0.14, 0.05, [255, 140, 60]], [0.27, 0.26, [255, 160, 80]], [0.38, 0.66, [255, 190, 112]],
+    [0.5, 1, [255, 218, 156]], [0.62, 0.66, [255, 190, 112]], [0.73, 0.26, [255, 160, 80]], [0.86, 0.05, [255, 140, 60]], [1, 0, [255, 130, 50]]];
+  for (let i = 0; i < BEAM_W; i++) {
+    const u = (i + 0.5) / BEAM_W;
+    const hw = lerp(2.4, BEAM_HW, Math.pow(u, 0.85));                 // the cone widens away from the lens
+    const a = Math.pow(1 - u, 1.25) * (0.6 + 0.4 * smoothstep(0, 0.08, u)) * (1 - smoothstep(0.86, 1, u));
+    const ext = Math.min(cy - 1, hw * 1.75 + 3);
+    const gr = g.createLinearGradient(0, cy - ext, 0, cy + ext);
+    for (const [t, k, col] of prof) gr.addColorStop(t, rgba(col, a * k));
+    g.fillStyle = gr;
+    g.fillRect(i, cy - ext, 1, ext * 2);
+  }
+  BEAM = c;
+  return c;
+}
+function beamGeom(G) {
+  const th = G.time * 0.9;
+  const c = Math.abs(Math.cos(th));
+  return { th, c, len: 1700 * c, half: 10 + 70 * c, inten: 0.4 + 0.6 * c, face: Math.pow(Math.max(0, Math.sin(th)), 8) };
+}
+
 function drawBeam(ctx, G, I, FP) {
   const on = lampOn(G);
   if (on <= 0.01) return;
@@ -2756,50 +3435,33 @@ function drawBeam(ctx, G, I, FP) {
   const d = Math.abs(L.x - G.cam.x);
   const k = beamK(G, d);
   if (k <= 0.01) return;
-  const th = G.time * 0.9;
+  const bm = beamGeom(G);
+  const spr = beamSprite();
   ctx.save();
   ctx.globalCompositeOperation = 'lighter';
-  for (const sgn of [1, -1]) {
-    const c = Math.cos(th) * sgn;
-    const face = Math.pow(Math.max(0, Math.sin(th) * sgn), 8);
-    if (c > 0.02) {
-      const len = 1700 * c;
-      const half = 10 + 70 * c;
-      const ex = L.x + len, ey = L.y + len * 0.05;
-      const g = ctx.createLinearGradient(L.x, L.y, ex, ey);
-      g.addColorStop(0, 'rgba(255,236,190,' + (0.42 * k * (0.4 + 0.6 * c)).toFixed(3) + ')');
-      g.addColorStop(0.4, 'rgba(255,226,170,' + (0.14 * k * c).toFixed(3) + ')');
-      g.addColorStop(1, 'rgba(255,220,160,0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.moveTo(L.x, L.y - 3);
-      ctx.lineTo(ex, ey - half);
-      ctx.lineTo(ex, ey + half * 0.75);
-      ctx.lineTo(L.x, L.y + 3);
-      ctx.closePath();
-      ctx.fill();
-    } else if (c < -0.02) {
-      // the opposite lens points the other way
-      const cc = -c, len = 1700 * cc, half = 10 + 70 * cc;
-      const ex = L.x - len, ey = L.y + len * 0.05;
-      const g = ctx.createLinearGradient(L.x, L.y, ex, ey);
-      g.addColorStop(0, 'rgba(255,236,190,' + (0.42 * k * (0.4 + 0.6 * cc)).toFixed(3) + ')');
-      g.addColorStop(0.4, 'rgba(255,226,170,' + (0.14 * k * cc).toFixed(3) + ')');
-      g.addColorStop(1, 'rgba(255,220,160,0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.moveTo(L.x, L.y - 3); ctx.lineTo(ex, ey - half); ctx.lineTo(ex, ey + half * 0.75); ctx.lineTo(L.x, L.y + 3); ctx.closePath();
-      ctx.fill();
+  if (bm.c > 0.02 && spr) {
+    // [width scale, length scale, alpha]: a wide faint haze, the beam, a hot narrow core
+    const passes = [[3, 1.05, 0.3], [1.15, 1, 0.72], [0.4, 0.72, 0.55]];
+    for (const dir of [1, -1]) {
+      for (const [ws, ls, al] of passes) {
+        const len = bm.len * ls;
+        ctx.save();
+        ctx.transform(dir * len / BEAM_W, BEAM_DROP * len / BEAM_W, 0, bm.half * ws / BEAM_HW, L.x, L.y);
+        ctx.globalAlpha = clamp(al * k * bm.inten, 0, 1);
+        ctx.drawImage(spr, 0, -BEAM_H / 2);
+        ctx.restore();
+      }
     }
-    if (face > 0.02 && sgn > 0) {
-      const r = 30 + 120 * face;
-      const rg = ctx.createRadialGradient(L.x, L.y, 0, L.x, L.y, r);
-      rg.addColorStop(0, 'rgba(255,250,230,' + (0.9 * k * face).toFixed(3) + ')');
-      rg.addColorStop(0.2, 'rgba(255,230,180,' + (0.35 * k * face).toFixed(3) + ')');
-      rg.addColorStop(1, 'rgba(255,220,160,0)');
-      ctx.fillStyle = rg;
-      ctx.fillRect(L.x - r, L.y - r, r * 2, r * 2);
-    }
+  }
+  if (bm.face > 0.02) {
+    const r = 30 + 120 * bm.face;
+    const rg = ctx.createRadialGradient(L.x, L.y, 0, L.x, L.y, r);
+    rg.addColorStop(0, 'rgba(255,246,222,' + (0.9 * k * bm.face).toFixed(3) + ')');
+    rg.addColorStop(0.2, 'rgba(255,214,150,' + (0.38 * k * bm.face).toFixed(3) + ')');
+    rg.addColorStop(1, 'rgba(255,190,120,0)');
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = rg;
+    ctx.fillRect(L.x - r, L.y - r, r * 2, r * 2);
   }
   ctx.restore();
 }
@@ -2867,16 +3529,90 @@ function drawFrontClump(ctx, I, c, FP, t, wind, P) {
 }
 
 // ------------------------------------------------------------------ the beast
+// While it emerges or melts away (alpha < 1) the body is rendered at full opacity into an
+// offscreen canvas sized to its bounds and composited once at B.alpha, so limbs, hair and fur
+// never show through each other like an x-ray. The eyes are drawn on top, on their own fade.
+let BEAST_CV = null;
 function drawBeast(ctx, G, B, FP) {
-  const I = ISL[B.isl];
   if (!onScreen(G, B.x, B.y - 60, 160)) return;
   const pose = beastPose(B);
+  const body = B.alpha;
+  if (body > 0.01) {
+    let done = false;
+    if (body < 0.995) { try { done = beastFaded(ctx, G, B, FP, pose, body); } catch (e) { oops('beast offscreen', e); } }
+    if (!done) {
+      ctx.save();
+      if (body < 0.995) ctx.globalAlpha = body;
+      beastBody(ctx, G, B, FP, pose);
+      ctx.restore();
+    }
+  }
+  beastEyes(ctx, B, pose);
+}
+
+function beastFaded(ctx, G, B, FP, pose, body) {
+  if (typeof document === 'undefined') return false;
+  const v = G.view;
+  const I = ISL[B.isl];
+  const sink = (1 - B.rise) * 30;
+  const lg = (lx) => gy(I, B.x + B.f * lx) - B.y - sink;
+  // bounds in local space (facing +x, origin at the feet): body, hanging hair, both hands
+  let x0 = pose.hip[0] - 48, x1 = pose.head[0] + 26, y0 = pose.hump[1] - 18, y1 = 10;
+  for (const h of [B.handN, B.handF]) {
+    if (!h) continue;
+    x0 = Math.min(x0, h[0] - 26); x1 = Math.max(x1, h[0] + 26);
+    y0 = Math.min(y0, h[1] - 26); y1 = Math.max(y1, h[1] + 24);
+  }
+  for (let lx = -40; lx <= 120; lx += 40) y1 = Math.max(y1, lg(lx) + 8);
+  let wx0 = B.f > 0 ? B.x + x0 : B.x - x1, wx1 = B.f > 0 ? B.x + x1 : B.x - x0;
+  let wy0 = B.y + sink + y0;
+  const wy1 = B.y + sink + y1;
+  // match the device pixel grid of the world transform so the composite stays crisp
+  let m = null;
+  try { m = ctx.getTransform(); } catch (e) { m = null; }
+  const full = m ? Math.abs(m.a) : (v.scale || 1) * (v.dpr || 1);
+  let k = Math.min(full, 3);
+  if ((wx1 - wx0) * (wy1 - wy0) * k * k > 4e6) k = Math.sqrt(4e6 / ((wx1 - wx0) * (wy1 - wy0)));
+  if (m && k === full && m.b === 0 && m.c === 0) {
+    wx0 = (Math.floor(m.a * wx0 + m.e) - m.e) / m.a;
+    wy0 = (Math.floor(m.d * wy0 + m.f) - m.f) / m.d;
+  }
+  const pw = Math.ceil((wx1 - wx0) * k) + 2, ph = Math.ceil((wy1 - wy0) * k) + 2;
+  if (!(pw > 2 && ph > 2) || !Number.isFinite(pw + ph)) return false;
+  if (!BEAST_CV || BEAST_CV.width < pw || BEAST_CV.height < ph) {
+    BEAST_CV = makeCanvas(Math.max(pw, BEAST_CV ? BEAST_CV.width : 0), Math.max(ph, BEAST_CV ? BEAST_CV.height : 0));
+  }
+  const g = BEAST_CV.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+  g.clearRect(0, 0, pw, ph);
+  g.setTransform(k, 0, 0, k, -wx0 * k, -wy0 * k);
+  beastBody(g, G, B, FP, pose);
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.save();
+  ctx.globalAlpha = body;
+  ctx.drawImage(BEAST_CV, 0, 0, pw, ph, wx0, wy0, pw / k, ph / k);
+  ctx.restore();
+  return true;
+}
+
+// How much warm light falls on the beast (the boy's lantern or a lit lamp on the raft).
+function beastWarm(G, B) {
+  const P = G.player;
+  let w = lanternLit(G) && P ? clamp(1 - Math.abs(P.x - B.x) / 170, 0, 1) : 0;
+  const lp = G.raft && G.raft.lampPos;
+  if (lp && Number.isFinite(lp.x) && Number.isFinite(lp.y)) w = Math.max(w, clamp(1 - Math.hypot(lp.x - B.x, lp.y - (B.y - 40)) / 190, 0, 1));
+  return w;
+}
+
+// The body, limbs, hair and rim light — always at full opacity (the caller fades it).
+function beastBody(ctx, G, B, FP, pose) {
+  const I = ISL[B.isl];
   const t = B.t;
   const sink = (1 - B.rise) * 30;
   const f = B.f;
-  const body = B.alpha;
-  const P = G.player;
-  const warm = lanternLit(G) && P ? clamp(1 - Math.abs(P.x - B.x) / 170, 0, 1) : 0;
+  const body = 1;
+  const warm = beastWarm(G, B);
   const lg = (lx) => gy(I, B.x + f * lx) - B.y - sink;
   ctx.save();
   ctx.translate(B.x, B.y + sink);
@@ -2909,8 +3645,8 @@ function drawBeast(ctx, G, B, FP) {
   };
   const backAt = (u) => bez(lowBack[0], lowBack[1], lowBack[0] - 6, lowBack[1] - 26, hump[0] - 16, hump[1], hump[0], hump[1], u);
 
-  if (body > 0.01) {
-    ctx.globalAlpha = body;
+  {
+    ctx.globalAlpha = 1;
     // ---- far limbs, darker, behind the body
     const footF = footPos(B, 0.5, lg, hip);
     limb(ctx, hip[0] + 4, hip[1] - 2, footF[0], footF[1], 24, 26, 1, 9, 3.4, darker);
@@ -3032,9 +3768,16 @@ function drawBeast(ctx, G, B, FP) {
     if (warm > 0.02) { ctx.strokeStyle = warmRim; ctx.beginPath(); ctx.moveTo(armN[0] + 2, armN[1]); ctx.lineTo(armN[2] + 1, armN[3]); ctx.stroke(); }
   }
   ctx.globalAlpha = 1;
+  ctx.restore();
+}
 
-  // ---- the eyes: pale, almost never blinking, visible before the body is
+// The eyes: pale, almost never blinking, visible before the body is (their own fade).
+function beastEyes(ctx, B, pose) {
   if (B.eyes > 0.01) {
+    const sink = (1 - B.rise) * 30;
+    ctx.save();
+    ctx.translate(B.x, B.y + sink);
+    ctx.scale(B.f, 1);
     const open = B.blink > 0 ? 0.12 : B.st === 'hesitate' ? 0.45 : 1;
     const ex = pose.eye[0], ey = pose.eye[1];
     const ea = B.eyes;
@@ -3052,8 +3795,8 @@ function drawBeast(ctx, G, B, FP) {
       ctx.fillStyle = 'rgba(238,247,255,' + (0.85 * ea * B.third).toFixed(3) + ')';
       ctx.beginPath(); ctx.ellipse(ex - 2.2, ey - 4.2, 1.1, 0.75 * B.third, -0.3, 0, TAU); ctx.fill();
     }
+    ctx.restore();
   }
-  ctx.restore();
 }
 
 function bez(x0, y0, x1, y1, x2, y2, x3, y3, u) {
@@ -3134,10 +3877,42 @@ function framePal(G) {
   const ph = G.phase || 0;
   if (FPC && Math.abs(FPC.n - n) < 0.002 && Math.abs(FPC.ph - ph) < 0.002) return FPC;
   const out = { n, ph };
-  for (const k in OBJ_DAY) out[k] = rgb(mixColor(OBJ_DAY[k], OBJ_NIGHT[k], n));
+  // golden hour: the low sun's horizon colour soaks into everything on land
+  const gk = goldK(ph);
+  out.gk = gk;
+  out.goldC = null;
+  if (gk > 0.002) {
+    const c = cel(G);
+    const hzn = c && Array.isArray(c.horizon) ? c.horizon : keyAt(HAZE_KEYS, ph);
+    out.goldC = mixColor(hzn, [255, 255, 255], 0.3);
+  }
+  const gw = out.goldC ? gk * 0.8 * (1 - n) : 0;
+  for (const k in OBJ_DAY) {
+    const c = mixColor(OBJ_DAY[k], OBJ_NIGHT[k], n);
+    if (gw > 0) { const t = out.goldC; for (let j = 0; j < 3; j++) c[j] = lerp(c[j], c[j] * t[j] / 255, gw); }
+    out[k] = rgb(c);
+  }
   // the far hills: the horizon haze of this hour, a touch darker and greener
   const hz = keyAt(HAZE_KEYS, ph);
-  out.far = rgb(mixColor(hz, [30, 52, 50], 0.18 * (1 - n)));
+  out.hzC = hz;
+  out.farC = mixColor(hz, [30, 52, 50], 0.18 * (1 - n));
+  out.far = rgb(out.farC);
   FPC = out;
   return out;
+}
+
+// 0..1: how golden the light is (around sunset 0.50–0.60 and just after sunrise 0.0–0.06)
+function goldK(ph) {
+  const dusk = smoothstep(0.5, 0.535, ph) * (1 - smoothstep(0.572, 0.6, ph));
+  const dawn = ph > 0.5 ? smoothstep(0.972, 1, ph) : 1 - smoothstep(0.03, 0.06, ph);
+  return Math.max(dusk, dawn);
+}
+
+// The sky's sun/moon/horizon for this step (null if the sky module isn't ready).
+let CEL = null, CELK = '';
+function cel(G) {
+  const v = G.view || {};
+  const key = (G.frame || 0) + ':' + (G.time || 0) + ':' + (v.cssW || 0) + ':' + (G.cam ? G.cam.y : 0);
+  if (key !== CELK) { CELK = key; try { CEL = celestial(G); } catch (e) { CEL = null; } }
+  return CEL;
 }

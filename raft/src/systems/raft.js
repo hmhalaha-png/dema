@@ -15,10 +15,12 @@
 //
 // Persistent: G.raft {x, tiles:[{hp, s, v}], anchored, sailUp}. `v` is a per-tile art seed.
 //   Structures: anchor{down} purifier{water,prog} grill{state,t} sail{up} lamp{on} bed{}.
-// Runtime: G.raftRt, plus G.raft.y / vx / beached (island id or null) / aground (bool) / lampLit.
+// Runtime: G.raftRt, plus G.raft.y / vx / beached (island id or null) / aground (bool) / lampLit /
+//   lampPos ({x,y} of the lit lamp's flame, or null) / busy (a fade cutscene is running: sailing
+//   around an island or sleeping; the player ignores movement and tool input, saves are refused).
 
-import { C, isNight, say, journal, skipToPhase, statClamp } from '../core/state.js';
-import { input } from '../core/input.js';
+import { C, say, journal, skipToPhase, statClamp } from '../core/state.js';
+import { input, hint } from '../core/input.js';
 import { waterY, addLight, addInteract, onScreen, worldToScreen } from '../core/world.js';
 import { emit } from '../core/particles.js';
 import { TAU, clamp, lerp, smoothstep, noise1, seeded, makeCanvas, rand, pick, mixColor } from '../core/util.js';
@@ -45,6 +47,11 @@ const WATER_MAX = 3;
 const WATER_TIME = 45;        // seconds per bottle in full daylight
 const COOK_TIME = 10;
 const REACH_X = 76, REACH_Y = 56;
+const MAX_SPEED = 34;         // drift + sail + storm never outrun the boy swimming after the raft
+const SLACK = 0.5;            // share of the sail's push left while nobody is aboard to trim it
+const BEACH_STEP = 6;         // a beached raft's front deck end stays at most this far above the sand
+const SLEEP_FROM = 0.72;      // the first part of every night is played, not slept through
+const SLEEP_COST = 45;        // hunger and thirst spent by a night's sleep
 let SPR = 4;                  // sprite pixels per world unit (matched to the device scale, see art())
 const NV = 10;                // tile art variants
 const FONT = '"PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans CJK SC","Noto Sans SC","WenQuanYi Zen Hei",sans-serif';
@@ -109,7 +116,7 @@ function rt(G) {
       ys: [], vs: [], as: [], yc: 0, slope: 0, lastX: NaN,
       sel: 'tile', build: null, wasBuilding: false, selT: 9,
       seq: null, beachSaid: null, wreck: [],
-      wasOn: false, airVY: 0, sailK: 0, dripT: 0,
+      wasOn: false, airVY: 0, sailK: 0, crewK: 1, dripT: 0,
       lampPos: null, grillPos: null,
     };
   }
@@ -174,10 +181,13 @@ export function init(G) {
   if (anc) anc.s.down = R.anchored;
   r.sailK = R.sailUp ? 1 : 0;
   R.vx = 0;
+  R.busy = false;
+  R.lampPos = null;
   R.beached = null;
   R.aground = false;
   R.lampLit = R.tiles.some((t) => t.s && t.s.type === 'lamp' && t.s.on);
   snapDeck(G, r);
+  r.crewK = G.demo || boyOnRaft(G) ? 1 : SLACK;
   // already sitting against an island (loaded game): don't announce it again
   const fx = R.x + R.tiles.length * TW;
   const g = isleGround(G, fx + 2.5);
@@ -263,8 +273,33 @@ function stepDeck(G, r, dt) {
     r.ys[i] += r.vs[i] * dt;
     if (!Number.isFinite(r.ys[i])) { r.ys[i] = tgt[i]; r.vs[i] = 0; }
   }
+  if (R.beached != null) restOnBeach(G, r);
   angles(r);
   R.y = deckAt(G, R.x + n * TW / 2);
+}
+
+// Beached: the nose rests on the sand. A wave may lift the rest of the raft, but the front
+// deck end stays within a small step of the beach, so the boy can walk between the two.
+function restOnBeach(G, r) {
+  const R = G.raft, n = R.tiles.length, len = n * TW, fx = R.x + len;
+  let g = null;
+  for (const x of [fx, fx + 2.5]) { const y = isleGround(G, x); if (y != null && (g == null || y < g)) g = y; }
+  if (g == null) return;
+  const ys = r.ys;
+  const edge = n === 1 ? ys[0] : ys[n - 1] + 0.5 * (ys[n - 1] - ys[n - 2]);
+  const over = (g - BEACH_STEP) - edge;          // > 0: the deck end sits too high above the sand
+  if (!(over > 0)) return;
+  // press the front down, fading out over the last couple of tiles (the raft pivots on its nose)
+  const w = (i) => clamp(1 - (len - (i + 0.5) * TW) / (2.5 * TW), 0, 1);
+  const gain = n === 1 ? w(0) : 1.5 * w(n - 1) - 0.5 * w(n - 2);
+  if (!(gain > 0.05)) return;
+  const d = over / gain;
+  for (let i = Math.max(0, n - 3); i < n; i++) {
+    const k = w(i);
+    if (k <= 0) continue;
+    ys[i] += d * k;
+    if (r.vs[i] < 0) r.vs[i] = 0;
+  }
 }
 
 export function deckAt(G, x) {
@@ -333,6 +368,7 @@ export function update(G, dt) {
   buildMode(G, r);
   updateWreck(G, r, dt);
   r.lastX = R.x;
+  R.busy = !!r.seq;
 }
 
 function syncFlags(G, r, dt) {
@@ -349,10 +385,14 @@ function drift(G, r, dt) {
   const R = G.raft, n = R.tiles.length, len = n * TW;
   const W = G.weather || {};
   const wind = Number.isFinite(W.wind) ? Math.max(0, W.wind) : 0.3;
+  // nobody aboard to trim it: the sail slackens to half its push (and fills again when he's back)
+  const crew = G.demo || boyOnRaft(G) ? 1 : SLACK;
+  r.crewK += clamp(crew - r.crewK, -dt * 0.8, dt * 0.8);
   let v = 0;
   if (!R.anchored && !r.seq) {
     v = C.DRIFT * clamp(0.82 + 0.6 * wind, 0.8, 1.7);
-    if (R.sailUp) v += C.SAIL_BOOST * clamp(0.55 + wind, 0.6, 2.2) * r.sailK;
+    if (R.sailUp) v += C.SAIL_BOOST * clamp(0.55 + wind, 0.6, 2.2) * r.sailK * r.crewK;
+    v = Math.min(v, MAX_SPEED);
   }
   const blocked = (fx) => { const g = isleGround(G, fx); return g != null && g < 0; };
   const front = R.x + len;
@@ -599,23 +639,32 @@ function structures(G, r, dt) {
     }
   }
   R.lampLit = lampLit;
+  // where the lit lamp's flame hangs (the frontmost one if there are several): islands.js lets
+  // the night beast fear it like a lantern
+  R.lampPos = r.lampPos ? { x: r.lampPos.x, y: r.lampPos.y } : null;
 }
 
 // ------------------------------------------------------------------ cutscenes (fades)
+const NOT_ABOARD = '得先回到木筏上，才能带着它离开。';
+
 function startAround(G) {
   const R = G.raft, r = rt(G);
   if (r.seq) return;
-  if (!boyOnRaft(G)) { say(G, '得先回到木筏上，才能带着它离开。'); return; }
+  if (!boyOnRaft(G)) { say(G, NOT_ABOARD); return; }
   const fx = R.x + R.tiles.length * TW;
   const isl = isleAt(G, fx + 2.5) || isleAt(G, fx + 8) || isleAt(G, fx);
   const goal = isl && ((typeof isl.kind === 'string' && /light|goal|end|灯塔/i.test(isl.kind)) ||
     (Number.isFinite(isl.x0) && Number.isFinite(isl.x1) && isl.x0 <= C.GOAL_X + 50 && isl.x1 >= C.GOAL_X - 50));
   if (goal) { say(G, '灯塔就在眼前了，不用再绕路。'); return; }
   r.seq = { kind: 'around', t: 0, t2: 0, moved: false, isl };
+  R.busy = true;
   play('sail');
 }
 
+// The screen is black: move the raft past the island. Returns false (nothing moved) when the
+// boy is no longer aboard — the raft never leaves without him.
 function doAround(G, r) {
+  if (!boyOnRaft(G)) { say(G, NOT_ABOARD); return false; }
   const R = G.raft, P = G.player, n = R.tiles.length, len = n * TW;
   const fx = R.x + len;
   const isl = r.seq.isl || isleAt(G, fx + 2.5) || isleAt(G, fx);
@@ -646,14 +695,17 @@ function doAround(G, r) {
     if (G.cam && Number.isFinite(G.cam.x)) G.cam.x += dx;
   }
   say(G, '绕过了小岛，木筏又漂回了大海上。');
+  return true;
 }
 
 function startSleep(G) {
   const r = rt(G);
   if (r.seq) return;
   if (G.phase >= C.NIGHT_END) { say(G, '天快亮了，不睡了。'); return; }
-  if (!(isNight(G) || G.phase >= 0.6)) { say(G, '还不困。'); return; }
-  r.seq = { kind: 'sleep', t: 0, done: false };
+  if (G.phase < SLEEP_FROM) { say(G, G.phase >= C.SUNSET ? '再等等，天才刚黑。' : '还不困。'); return; }
+  if (!boyOnRaft(G)) { say(G, '得先爬上木筏才能睡觉。'); return; }
+  r.seq = { kind: 'sleep', t: 0, done: false, slept: false };
+  G.raft.busy = true;
   play('sleep');
 }
 
@@ -661,8 +713,8 @@ function doSleep(G) {
   const P = G.player, R = G.raft;
   try { skipToPhase(G, 0.01); } catch (e) { oops('skipToPhase', e); }
   if (P) {
-    P.hunger = statClamp((P.hunger || 0) - 25);
-    P.thirst = statClamp((P.thirst || 0) - 25);
+    P.hunger = statClamp((P.hunger || 0) - SLEEP_COST);
+    P.thirst = statClamp((P.thirst || 0) - SLEEP_COST);
   }
   // the night passes for the raft too
   for (const t of R.tiles) {
@@ -681,7 +733,7 @@ function updateSeq(G, r, dt) {
   if (q.kind === 'around') {
     if (!q.moved) {
       G.fade = Math.max(G.fade || 0, smoothstep(0, 0.8, q.t));
-      if (q.t >= 0.85) { G.fade = 1; doAround(G, r); q.moved = true; q.t2 = 0; }
+      if (q.t >= 0.85) { G.fade = 1; doAround(G, r); q.moved = true; q.t2 = 0; }   // (or cancelled: fade back in)
     } else {
       q.t2 += dt;
       G.fade = 1 - smoothstep(0.35, 1.35, q.t2);
@@ -689,10 +741,13 @@ function updateSeq(G, r, dt) {
     }
   } else if (q.kind === 'sleep') {
     if (q.t < 1.4) G.fade = Math.max(G.fade || 0, smoothstep(0, 1.3, q.t));
-    else if (!q.done) { G.fade = 1; q.done = true; doSleep(G); }
-    else {
+    else if (!q.done) {
+      G.fade = 1; q.done = true;
+      // he slipped off the raft while the screen went dark (a hop, a wave): no sleep in the sea
+      if (boyOnRaft(G)) { doSleep(G); q.slept = true; } else { say(G, '得先爬上木筏才能睡觉。'); q.t = 2.6; }
+    } else {
       G.fade = 1 - smoothstep(2.6, 4.2, q.t);
-      if (q.t >= 4.2) { G.fade = 0; r.seq = null; say(G, '天亮了。'); }
+      if (q.t >= 4.2) { G.fade = 0; r.seq = null; if (q.slept) say(G, '天亮了。'); }
     }
   } else r.seq = null;
 }
@@ -790,7 +845,7 @@ function doBuild(G, r, t) {
     if (UNIQUE[t.type] && findStruct(R, t.type)) { say(G, '已经有一个' + itemName(t.type) + '了。'); return; }
     if (!pay(G, { [t.type]: 1 })) { say(G, '没有' + itemName(t.type) + '了。'); return; }
     tile.s = newStruct(t.type);
-    if (t.type === 'sail') { R.sailUp = false; say(G, '船帆装好了。按 E 升帆，木筏会漂得更快。'); }
+    if (t.type === 'sail') { R.sailUp = false; say(G, hint('船帆装好了。按 E 升帆，木筏会漂得更快。', '船帆装好了。点「互动」升帆，木筏会漂得更快。')); }
     else if (t.type === 'purifier') say(G, '净水器装好了，太阳会把海水晒成淡水。');
     else if (t.type === 'grill') say(G, '烤架搭好了。有生鱼和木板就能烤鱼。');
     else if (t.type === 'lamp') say(G, '灯柱立起来了。夜里，光会让那些东西离远一点。');
@@ -2083,7 +2138,9 @@ function drawSail(b, G, r, A, s, i, t, wind, ghost) {
   const boomY = -17;
   const headY = lerp(boomY - 3.5, -72, k);
   if (k > 0.04) {
-    const bil = (3 + wv * 4.5 + flap) * k;
+    // nobody aboard to trim it: the sail spills its wind and luffs
+    const slack = ghost ? 0 : clamp((1 - (Number.isFinite(r.crewK) ? r.crewK : 1)) / (1 - SLACK), 0, 1);
+    const bil = (3 + wv * 4.5 * (1 - 0.55 * slack) + flap * (1 + 1.2 * slack)) * k;
     const hx = -1, top = headY;
     const path = () => {
       b.beginPath();
@@ -2320,7 +2377,7 @@ function drawPost(ctx, G, r, A, t, post, night) {
       ctx.restore();
       // moths circling the light at night
       if (night > 0.3) {
-        const c = r.lampPos;
+        const c = toWorld(f, L.x, L.y);
         if (c) {
           ctx.save();
           ctx.fillStyle = `rgba(255,230,190,${(0.75 * night).toFixed(3)})`;
@@ -2420,7 +2477,7 @@ export function drawBuildGhost(ctx, G) {
     let note = null;
     if (T.reason) note = T.reason;
     else if (T.far) note = '离得太远了';
-    else if (B.opts.length > 1) note = (input.touch ? '「切换」 ' : '[Q] 切换  ') + B.opts.map((o) => (o === B.sel ? '「' + itemName(o === 'tile' ? 'tile' : o) + '」' : itemName(o))).join(' ');
+    else if (B.opts.length > 1) note = hint('[Q] 切换  ', '「切换」 ') + B.opts.map((o) => (o === B.sel ? '「' + itemName(o === 'tile' ? 'tile' : o) + '」' : itemName(o))).join(' ');
     const lh = T.kind !== 'place' ? 22 : T.type === 'sail' ? 88 : T.type === 'lamp' ? 56 : 30;
     drawLabel(ctx, G, T.x, T.y - lh, name, segs, note, sc);
   } else if (B.noRoom) {
