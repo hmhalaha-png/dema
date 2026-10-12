@@ -98,18 +98,36 @@ function see(G, c, id) {
   discover(G, id);
 }
 
+// Is (x, y) inside island soil? (dry land columns, or below an island's underwater slope)
+function inSoil(G, x, y) {
+  const g = islandGround(G, x);
+  return g != null && g < y;
+}
+// Is x a dry-land column: island ground standing above the water line?
+function dryLand(G, x) {
+  const g = islandGround(G, x);
+  return g != null && g < wy(G, x) + 1;
+}
+
 function bubbles(G, x, y, n, spread = 6, size = 1.5) {
   for (let i = 0; i < n; i++) {
-    emit(G, { x: x + rand(-spread, spread), y: y + rand(-spread, spread) * 0.6, vx: rand(-6, 6), vy: rand(-36, -16), life: rand(1, 2.4), size: rand(size * 0.5, size * 1.3), kind: 'bubble', color: [215, 238, 248], alpha: 0.75, water: 'below' });
+    const bx = x + rand(-spread, spread), by = y + rand(-spread, spread) * 0.6;
+    if (inSoil(G, bx, by)) continue;
+    emit(G, { x: bx, y: by, vx: rand(-6, 6), vy: rand(-36, -16), life: rand(1, 2.4), size: rand(size * 0.5, size * 1.3), kind: 'bubble', color: [215, 238, 248], alpha: 0.75, water: 'below' });
   }
 }
 function splash(G, x, n, power = 1) {
+  if (dryLand(G, x)) return;
   const y = wy(G, x);
   for (let i = 0; i < n; i++) {
-    emit(G, { x: x + rand(-6, 6) * power, y: y - 1, vx: rand(-40, 40) * power, vy: rand(-120, -40) * power, life: rand(0.5, 1.0), size: rand(1, 2.4), gravity: 300, color: [232, 244, 248], alpha: 0.85, water: 'above' });
+    const sx = x + rand(-6, 6) * power;
+    if (i && dryLand(G, sx)) continue;
+    emit(G, { x: sx, y: y - 1, vx: rand(-40, 40) * power, vy: rand(-120, -40) * power, life: rand(0.5, 1.0), size: rand(1, 2.4), gravity: 300, color: [232, 244, 248], alpha: 0.85, water: 'above' });
   }
   for (let i = 0; i < Math.ceil(n / 3); i++) {
-    emit(G, { x: x + rand(-8, 8) * power, y: y + rand(2, 6), vx: rand(-10, 10), vy: rand(-12, 4), life: rand(0.8, 1.6), size: rand(1, 2), kind: 'bubble', color: [220, 240, 250], alpha: 0.7, water: 'below' });
+    const bx = x + rand(-8, 8) * power, by = y + rand(2, 6);
+    if (inSoil(G, bx, by)) continue;
+    emit(G, { x: bx, y: by, vx: rand(-10, 10), vy: rand(-12, 4), life: rand(0.8, 1.6), size: rand(1, 2), kind: 'bubble', color: [220, 240, 250], alpha: 0.7, water: 'below' });
   }
 }
 
@@ -243,6 +261,7 @@ function catchFish(G, s, f) {
   }
 }
 
+const FLEE_R = 60, FLEE_SPEED = 20, FLEE_CLOSE = 32, PANIC_MAX = 52;   // the boy swims 64 u/s
 function stepSchool(G, s, dt, B) {
   const sp = SPECIES[s.sp], fish = s.fish, n = fish.length;
   if (!n) return;
@@ -279,7 +298,9 @@ function stepSchool(G, s, dt, B) {
   }
   const t = G.time;
   const sepR = sp.L * 1.15;
-  const fleeR = 84;
+  // Fish shy away from a swimming boy, but a still or slowly gliding diver can get within a
+  // spear's reach; once they bolt they are only a little slower than he is.
+  const fleeR = FLEE_R;
   const cruise = sp.speed * (lanternCall ? 1.1 : 1);
   for (let i = 0; i < n; i++) {
     const f = fish[i];
@@ -299,7 +320,7 @@ function stepSchool(G, s, dt, B) {
       const dx = f.x - B.cx, dy = f.y - B.cy;
       if (dx < fleeR && dx > -fleeR && dy < fleeR && dy > -fleeR) {
         const d = Math.hypot(dx, dy) || 1;
-        if (d < fleeR && (B.speed > 8 || d < 40)) {
+        if (d < fleeR && (B.speed > FLEE_SPEED || d < FLEE_CLOSE)) {
           const k = (1 - d / fleeR) * 1100;
           ax += (dx / d) * k; ay += (dy / d) * k;
           s.panic = Math.max(s.panic, 1.2);
@@ -312,7 +333,7 @@ function stepSchool(G, s, dt, B) {
     if (f.y > fy - 16) ay -= (f.y - fy + 16) * 9;
     f.vx += ax * dt; f.vy += ay * dt;
     f.vy *= 1 - Math.min(1, dt * 1.2);
-    const maxS = cruise * (s.panic > 0 ? 3.4 : 1.5), minS = cruise * 0.35;
+    const maxS = s.panic > 0 ? Math.min(cruise * 3.4, PANIC_MAX) : cruise * 1.5, minS = cruise * 0.35;
     const spd = Math.hypot(f.vx, f.vy) || 0.01;
     if (spd > maxS) { f.vx *= maxS / spd; f.vy *= maxS / spd; } else if (spd < minS) { f.vx *= minS / spd; f.vy *= minS / spd; }
     f.x += f.vx * dt; f.y += f.vy * dt;
@@ -334,6 +355,11 @@ function stepSchool(G, s, dt, B) {
 // =====================================================================================
 
 const SHARK_L = 96;
+const LAMP_PATROL = 250;   // patrol radius past the raft ends while the raft lamp is lit at night
+const LAMP_CLEAR = 190;    // jellyfish keep this far from the raft ends while the lamp is lit
+
+// Is the raft's lamp burning in the dark? (it keeps night things away from the raft)
+const lampGuarding = (G) => !!(G.raft && G.raft.lampLit) && isDark(G);
 
 function makeShark(G, x, y, dir) {
   return {
@@ -364,6 +390,9 @@ function updShark(G, c, dt, B) {
 
   // shallow water around the raft (beached at an island): keep to the deep behind it
   const shallow = floorAt(G, mid) < 130;
+  // a lit lamp on the raft at night keeps the shark out of its light: it circles wider and
+  // never bites the raft; in the dark without a lamp it grows bolder
+  const lampGuard = lampGuarding(G);
   const home = shallow ? mid - W * 0.6 : mid;
   const sx = c.x + c.face * SHARK_L * 0.44 * Math.cos(c.pitch), sy = c.y + Math.sin(c.pitch) * SHARK_L * 0.44;
   const boyD = Math.hypot(B.cx - c.x, B.cy - c.y);
@@ -393,12 +422,13 @@ function updShark(G, c, dt, B) {
     case 'patrol': {
       c.depthT -= dt;
       if (c.depthT <= 0) { c.depthT = rand(5, 11); c.surf = chance(0.55); }
-      const R0 = half + 120;
+      const R0 = half + (lampGuard ? LAMP_PATROL : 120);
       if ((c.side > 0 && c.x > home + R0 - 25) || (c.side < 0 && c.x < home - R0 + 25)) c.side = -c.side;
       tx = home + c.side * (R0 + 40);
       ty = c.surf ? 17 : 52 + Math.sin(c.st * 0.3) * 30;
       want = c.surf ? 36 : 44;
-      c.biteT -= dt;
+      if (lampGuard) c.biteT = Math.max(c.biteT, 30);
+      else c.biteT -= dt * (isDark(G) ? 1.7 : 1);
       if (boyNear && c.cd <= 0) { c.state = 'stalk'; c.st = 0; c.orbit = Math.atan2(c.y - B.cy, c.x - B.cx); }
       else if (c.biteT <= 0 && !shallow && !B.inWater && G.mode === 'play' && R.tiles && R.tiles.length >= 2 && G.time > 100) {
         c.state = 'biteGo'; c.st = 0; c.biteSide = c.x < mid ? -1 : 1; c.bit = false;
@@ -442,12 +472,14 @@ function updShark(G, c, dt, B) {
     }
     case 'biteGo': {
       if (boyNear) { c.state = 'stalk'; c.st = 0; break; }
+      if (lampGuard) { c.state = 'patrol'; c.st = 0; c.biteT = rand(30, 50); break; }
       const edge = c.biteSide < 0 ? R.x : R.x + raftLen(G);
       tx = edge + c.biteSide * (SHARK_L * 0.9); ty = 34; want = 60;
       if (Math.abs(c.x - tx) < 26 || c.st > 14) { c.state = 'biteRush'; c.st = 0; }
       break;
     }
     case 'biteRush': {
+      if (lampGuard) { c.state = 'retreat'; c.st = 0; c.biteT = rand(30, 50); break; }
       const edge = c.biteSide < 0 ? R.x : R.x + raftLen(G);
       tx = edge - c.biteSide * 6; ty = 7; want = 130;
       if (Math.abs(sx - edge) < 9 || c.st > 3) {
@@ -591,10 +623,14 @@ function spawnManta(G, dir, x) {
 }
 
 const WHALE_L = 560;
+// The whale glides in deep and rises under the raft: its back (~65 units above its centre)
+// stays below the raft's logs and the floating debris, but the giant fills the lower half
+// of the frame (above the hotbar) as it passes.
+const WHALE_DEEP = 265, WHALE_APEX = 104;
 function spawnWhale(G, dir, x) {
   dir = dir || (chance(0.5) ? 1 : -1);
   const W = viewW(G);
-  const c = { kind: 'whale', layer: 'deep', x: x != null ? x : G.cam.x - dir * (W * 0.5 + WHALE_L * 0.55), y: 285, dir, t: 0, seen: false, major: true, sang: 0, fin: 0, tail: 0, pitch: 0, dark: 0 };
+  const c = { kind: 'whale', layer: 'deep', x: x != null ? x : G.cam.x - dir * (W * 0.5 + WHALE_L * 0.55), y: WHALE_DEEP, dir, t: 0, seen: false, major: true, sang: 0, fin: 0, tail: 0, pitch: 0, dark: 0 };
   G.creatures.push(c);
   G.persist.life.whaleDay = G.day;
   sfx('whale');
@@ -607,9 +643,13 @@ function spawnJelly(G, near) {
   const jellies = [];
   const n = randi(11, 15);
   const cols = [[110, 220, 255], [255, 140, 220], [180, 150, 255], [140, 255, 210], [120, 200, 255]];
+  // a lit raft lamp keeps the bloom out of its light
+  const lamp = lampGuarding(G), mid = raftMid(G), clear = raftLen(G) / 2 + LAMP_CLEAR;
+  const lit = (x) => lamp && Math.abs(x - mid) < clear;
   for (let i = 0; i < n; i++) {
     let x = ax + rand(-360, 360);
-    for (let tries = 0; tries < 8 && floorAt(G, x) < 90; tries++) x = ax + rand(-360, 360);
+    for (let tries = 0; tries < 8 && (floorAt(G, x) < 90 || lit(x)); tries++) x = ax + rand(-360, 360);
+    if (lit(x)) x = mid + (x < mid ? -1 : 1) * (clear + rand(10, 220));
     const fl = floorAt(G, x);
     if (fl < 90) continue;
     const ty = clamp(rand(28, 160), 20, fl - 40);
@@ -633,14 +673,16 @@ function moonInfo(G) {
   try { return celestial(G); } catch (e) { return null; }
 }
 
+// The moon whale breaches right under the moon, sized and lifted so that its body rises
+// across the moon's face ("它跃出水面的时候，正好挡住了月亮").
 function spawnMoonWhale(G) {
-  const cel = moonInfo(G);
   const W = G.view.cssW || 1280;
-  let fx = 0.64;
-  if (cel && cel.moonVisible && isFinite(cel.moonX)) fx = cel.moonX / W;
-  if (Math.abs(fx - 0.5) < 0.14) fx = 0.5 + (fx < 0.5 ? -1 : 1) * rand(0.14, 0.22);
-  fx = clamp(fx, 0.12, 0.88);
-  const c = { kind: 'moon_whale', layer: 'horizon', t: 0, dur: 11, fx, cx0: G.cam.x, side: chance(0.5) ? 1 : -1, drops: [], seen: false, major: true, hit: false, sang: false, spray: 0 };
+  const mb = moonBreach(G);
+  const fx = mb ? clamp(mb.x / W, 0.03, 0.97) : 0.64;
+  const c = {
+    kind: 'moon_whale', layer: 'horizon', t: 0, dur: 11, fx, cx0: G.cam.x, side: chance(0.5) ? 1 : -1, drops: [], seen: false, major: true, hit: false, sang: false, spray: 0,
+    k: mb ? mb.k : 1, lift: mb ? mb.lift : MW_LIFT0, track: !!mb,
+  };
   G.creatures.push(c);
   return c;
 }
@@ -784,8 +826,8 @@ function scheduler(G, dt, B) {
   } else if (isDark(G)) {
     w('jelly', 3);
     if (!has(G, 'plankton')) w('plankton', 2.4);
-    const cel = moonInfo(G);
-    if (cel && cel.moonVisible && G.view.seaScreenY > 80) w('moon_whale', 1.7);
+    const mb = moonBreach(G);
+    if (mb && mb.ok && G.view.seaScreenY > 80) w('moon_whale', mb.k < 1.5 ? 2.6 : 1.9);
     if (G.day >= 2 && G.day - PL.levDay >= 2 && G.view.seaScreenY > 120) w('leviathan', 0.9);
   }
   if (!cand.length) { L.cool = 12; return; }
@@ -846,6 +888,11 @@ function updFlyingFish(G, c, dt) {
     alive++;
     if (f.delay > 0) { f.delay -= dt; continue; }
     const w = wy(G, f.x);
+    // an island in the way: the fish slips away under the water (gone) instead of flying,
+    // swimming or splashing inside the soil — in the water at a dry-land column or at an
+    // underwater slope, or coming down onto the ground in the air
+    const g = islandGround(G, f.x);
+    if (g != null && (f.y > g - 3 || (f.mode !== 'air' && g < w + 1))) { f.gone = true; continue; }
     if (f.mode === 'swim') {
       f.x += f.vx * dt;
       f.vy += (-70 - f.vy) * Math.min(1, dt * 3);
@@ -945,7 +992,7 @@ function updWhale(G, c, dt) {
   const mid = raftMid(G);
   c.x += c.dir * 26 * dt;
   const u = Math.exp(-Math.pow((c.x - mid) / 430, 2));
-  const ty = lerp(285, 150, u);
+  const ty = lerp(WHALE_DEEP, WHALE_APEX, u);
   const vy = (ty - c.y) * Math.min(1, dt * 0.5);
   c.y += vy;
   c.pitch += (clamp(vy / dt / 26 * 0.6, -0.12, 0.12) * c.dir - c.pitch) * Math.min(1, dt);
@@ -967,6 +1014,7 @@ function updJelly(G, c, dt, B) {
   c.t += dt;
   const L = G.life;
   const fading = c.t > c.dur;
+  const lamp = lampGuarding(G), mid = raftMid(G), clear = raftLen(G) / 2 + LAMP_CLEAR;
   let alive = 0;
   for (const j of c.jellies) {
     if (j.a <= 0.01) continue;
@@ -977,7 +1025,9 @@ function updJelly(G, c, dt, B) {
     const sinking = fading || j.hurt;
     const target = sinking ? 12 : (j.y > j.ty ? -16 * thrust - 2.5 : 3 - thrust * 6);
     j.vy += (target - j.vy) * Math.min(1, dt * 2.5);
-    j.x += (j.vx + Math.sin(c.t * 0.3 + j.ph * 0.1) * 2) * dt;
+    // jellies drifting into the light of a lit raft lamp slowly pulse back out of it
+    const shy = lamp && j.y < 240 && Math.abs(j.x - mid) < clear ? (j.x < mid ? -1 : 1) * (6 + 10 * thrust) : 0;
+    j.x += (j.vx + shy + Math.sin(c.t * 0.3 + j.ph * 0.1) * 2) * dt;
     j.y += j.vy * dt;
     j.y = Math.max(j.y, wy(G, j.x) + j.r + 4);
     if (sinking) j.a = Math.max(0, j.a - dt * (j.hurt ? 0.25 : 0.08));
@@ -1051,7 +1101,29 @@ function updPlankton(G, c, dt, B) {
   if (!c.seen && k > 0.5 && (visible || (B.inWater && B.y < 260))) see(G, c, 'plankton');
 }
 
-const MW_LEN = 210;   // the breaching whale's length on screen at 720p
+const MW_LEN = 210;   // the breaching whale's length on screen at 720p (before scaling to the moon)
+const MW_LIFT0 = 0.28;                    // apex height of its centre above the horizon (body lengths) when no moon
+const MW_BELLY = 0.15;                    // the thick of the body sits this far ahead of the centre (head up)
+const MW_KMIN = 0.85, MW_KMAX = 2;        // how much it may be scaled to reach the moon
+const MW_LIFTMIN = 0.15, MW_LIFTMAX = 0.5;
+const mwLen = (G, c) => MW_LEN * unitOf(G) * (c.k || 1);
+
+// Where the moon hangs on screen and how to stage the breach so the body crosses it:
+// {x, H (moon height above the far horizon, px), k (size), lift, ok (the whale can reach it)}.
+function moonBreach(G) {
+  const cel = moonInfo(G);
+  const v = G.view;
+  if (!cel || !cel.moonVisible || !isFinite(cel.moonX) || !isFinite(cel.moonY) || !v) return null;
+  const L0 = MW_LEN * unitOf(G);
+  const hy = v.seaScreenY - 7 * v.scale;
+  const H = hy - cel.moonY;
+  const r = isFinite(cel.moonR) ? cel.moonR : 20;
+  const k = clamp(H / ((0.42 + MW_BELLY) * L0), MW_KMIN, MW_KMAX);
+  const lift = clamp(H / (k * L0) - MW_BELLY, MW_LIFTMIN, MW_LIFTMAX);
+  const reach = (lift + MW_BELLY) * k * L0;
+  const ok = H > r * 0.5 && Math.abs(reach - H) < Math.max(10, r * 0.5) && cel.moonX > r && cel.moonX < v.cssW - r;
+  return { x: cel.moonX, H, k, lift, ok };
+}
 function horizonScreenX(G, c, fx) {
   const v = G.view;
   return fx * v.cssW - (G.cam.x - c.cx0) * v.scale * 0.035;
@@ -1066,14 +1138,19 @@ function updMoonWhale(G, c, dt) {
   c.t += dt;
   const u = unitOf(G);
   const v = G.view;
+  // keep right under the (slowly travelling) moon until the apex
+  if (c.track && c.t < 3.3) {
+    const cel = moonInfo(G);
+    if (cel && isFinite(cel.moonX) && v.cssW > 0) c.fx = (cel.moonX + (G.cam.x - c.cx0) * v.scale * 0.035) / v.cssW;
+  }
   if (c.t > 0.4 && !c.sang) { c.sang = true; if (horizonVisible(G)) sfx('whale'); }
   if (c.t > 1.2 && horizonVisible(G) && !c.seen) see(G, c, 'moon_whale');
   // spray running off the body while it rises, the big splash when it falls back
   const sx = horizonScreenX(G, c, c.fx);
   const hy = v.seaScreenY - 7 * v.scale;
-  const Lw = MW_LEN * u;
-  if (c.t > 0.7 && c.t < 3.6 && chance(dt * 45)) {
-    const pose = whalePose(c, u);
+  const Lw = mwLen(G, c);
+  if (c.t > 0.7 && c.t < 3.6 && chance(dt * 45 * Math.min(2, c.k || 1))) {
+    const pose = whalePose(c, Lw);
     const s = rand(-0.45, 0.35) * Lw;
     const py = hy - pose.h + Math.sin(pose.a) * s;
     if (py < hy - 3) c.drops.push({ x: sx + pose.x + Math.cos(pose.a) * s + rand(-0.06, 0.06) * Lw, y: py, vx: rand(-14, 14) * u, vy: rand(-10, 20) * u, life: rand(0.8, 1.6), s: rand(0.8, 1.8) * u });
@@ -1081,7 +1158,7 @@ function updMoonWhale(G, c, dt) {
   if (c.t > 4.85 && !c.hit) {
     c.hit = true;
     if (horizonVisible(G)) sfx('splash');
-    const bx = sx + whalePose(c, u).x + c.side * Lw * 0.35;
+    const bx = sx + whalePose(c, Lw).x + c.side * Lw * 0.35;
     for (let i = 0; i < 110; i++) { const k = Math.random(); c.drops.push({ x: bx + (k - 0.5) * 0.7 * Lw, y: hy - rand(0, 6) * u, vx: (k - 0.5) * 90 * u + rand(-15, 15) * u, vy: -rand(40, 170) * u * (1 - Math.abs(k - 0.5)), life: rand(1.2, 2.8), s: rand(0.8, 2.6) * u }); }
   }
   for (const d of c.drops) { d.life -= dt; d.vy += 120 * u * dt; d.x += d.vx * dt; d.y += d.vy * dt; }
@@ -1094,16 +1171,17 @@ function updMoonWhale(G, c, dt) {
   if (c.t > c.dur) c.dead = true;
 }
 
-// Pose of the breaching whale: centre x (screen), height of its centre above the horizon, body angle.
-function whalePose(c, u) {
-  const Lw = MW_LEN * u;
+// Pose of the breaching whale (Lw: its length in px): centre x offset (screen), height of its
+// centre above the horizon, body angle.
+function whalePose(c, Lw) {
   const t = c.t;
+  const top = Lw * (c.lift != null ? c.lift : MW_LIFT0);
   let h, a;
   const up = -Math.PI / 2;
   if (t < 0.6) { h = -Lw * 0.6; a = up + 0.1 * c.side; }
-  else if (t < 2.7) { const p = (t - 0.6) / 2.1; h = lerp(-Lw * 0.6, Lw * 0.28, 1 - Math.pow(1 - p, 2.2)); a = up + 0.1 * c.side; }
-  else if (t < 3.3) { h = Lw * 0.28 + Math.sin((t - 2.7) / 0.6 * Math.PI) * Lw * 0.02; a = up + (0.1 + 0.25 * (t - 2.7) / 0.6) * c.side; }
-  else { const p = Math.min(1, (t - 3.3) / 1.6); h = lerp(Lw * 0.28, -Lw * 0.3, p * p); a = up + lerp(0.35, 1.5, p * (2 - p)) * c.side; }
+  else if (t < 2.7) { const p = (t - 0.6) / 2.1; h = lerp(-Lw * 0.6, top, 1 - Math.pow(1 - p, 2.2)); a = up + 0.1 * c.side; }
+  else if (t < 3.3) { h = top + Math.sin((t - 2.7) / 0.6 * Math.PI) * Lw * 0.02; a = up + (0.1 + 0.25 * (t - 2.7) / 0.6) * c.side; }
+  else { const p = Math.min(1, (t - 3.3) / 1.6); h = lerp(top, -Lw * 0.3, p * p); a = up + lerp(0.35, 1.5, p * (2 - p)) * c.side; }
   const drift = t < 3.3 ? 0 : Math.min(1, (t - 3.3) / 1.6) * Lw * 0.22 * c.side;
   return { h, a, x: drift };
 }
@@ -1279,7 +1357,7 @@ export function debugSpawn(G, kind) {
   switch (kind) {
     case 'whale': {
       const c = spawnWhale(G, 1, cx + 170 - WHALE_L * 0.5);
-      c.y = 160; c.seen = false;
+      c.y = WHALE_APEX + 14; c.seen = false;
       return true;
     }
     case 'manta': spawnManta(G, -1, cx + 150); return true;
@@ -2848,8 +2926,8 @@ function drawMoonWhale(ctx, G, c) {
   const v = G.view, u = unitOf(G);
   const hy = v.seaScreenY - 7 * v.scale;
   const sx = horizonScreenX(G, c, c.fx);
-  const Lw = MW_LEN * u;
-  const pose = whalePose(c, u);
+  const Lw = mwLen(G, c);
+  const pose = whalePose(c, Lw);
   const fade = 1 - smoothstep(c.dur - 2, c.dur, c.t);
   ctx.save();
   ctx.beginPath(); ctx.rect(0, 0, v.cssW, hy + 1); ctx.clip();

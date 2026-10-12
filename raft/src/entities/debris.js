@@ -2,14 +2,15 @@
 //
 // The sea brings the boy his building materials: planks, plastic bottles, tangled nets,
 // rusty sheet metal, soaked cloth, palm fronds, barrels, the odd crate hanging under the
-// surface and — at most once a day — a message bottle with a letter from a girl who also
-// drifted. Everything is painted procedurally into small cached sprites (one per
+// surface and — further along the journey — message bottles with letters from a girl who
+// also drifted (letter k turns up once the raft is past k × LETTER_STEP). Everything is painted procedurally into small cached sprites (one per
 // type × variant) and drawn bobbing and rolling on the waves.
 //
 // Exports (CONTRACT §5): init, update, draw, hookCatch, collectAttached.
 // Extra: spawnDebrisNear(G, x, n) (used by life.debugSpawn), LETTERS.
 
 import { C, say, journal } from '../core/state.js';
+import { hint } from '../core/input.js';
 import { waterY, seabedY, onScreen, addLight } from '../core/world.js';
 import { emit } from '../core/particles.js';
 import { TAU, clamp, rand, randi, chance, hash1, seeded, makeCanvas } from '../core/util.js';
@@ -19,7 +20,12 @@ import * as islands from '../systems/islands.js';
 
 // =====================================================================================
 // the letters (message bottles). Read in order; G.persist.flags.notes counts them.
+// Letter k (0-based) can drift by once the raft has travelled past k * LETTER_STEP, so all
+// eight can be found on one trip to the lighthouse (the last one past ~17500).
 // =====================================================================================
+
+const LETTER_STEP = 2500;
+const LETTER_CHANCE = 0.15;   // per regular spawn while the next letter is due
 
 export const LETTERS = [
   '如果你看到这封信……说明海上不止我一个人。我叫小满，今年十二岁。暴风雨那天晚上船翻了，我抱着一只木箱漂到了天亮。你也是这样吗？',
@@ -76,7 +82,7 @@ function lootFor(type) {
     case 'scrap': return [['metal', 1]];
     case 'cloth': return [['cloth', randi(1, 2)]];
     case 'frond': return [['leaf', randi(1, 2)]];
-    case 'barrel': return mixedLoot(randi(3, 5), 0.3, 0);
+    case 'barrel': return mixedLoot(randi(3, 5), 0.3, 0.25);
     case 'crate': return mixedLoot(randi(4, 6), 0.4, 0.25);
     case 'note': return [['note', 1]];
   }
@@ -132,20 +138,27 @@ function landAt(G, x) {
   return g != null && isFinite(g) ? g : null;
 }
 
+// Is an unread letter waiting to drift by at this point of the journey?
+function letterDue(G) {
+  const k = flags(G).notes | 0;
+  const rx = G.raft && isFinite(G.raft.x) ? G.raft.x : 0;
+  return k < LETTERS.length && rx > k * LETTER_STEP;
+}
+
 function spawn(G, x, forceType, initial) {
   if (!isFinite(x)) return null;
   const land = landAt(G, x);
   if (land != null && land < 14) return null;
   let type = forceType || chooseType();
 
-  // a message bottle: at most one per day, only while unread letters remain
-  const F = flags(G);
-  if (!forceType && !G.demo && !initial && F.noteDay !== G.day && (F.notes | 0) < LETTERS.length
-    && G.phase > 0.08 && G.phase < 0.9 && chance(0.07) && !G.debris.some((d) => d.type === 'note')) {
+  // a message bottle: the next unread letter, once the raft has come far enough for it
+  // (nothing is remembered at spawn time: a bottle that drifts away or a reload just means
+  // another one comes by a little later)
+  if (!forceType && !G.demo && !initial && letterDue(G) && G.phase > 0.08 && G.phase < 0.9
+    && chance(LETTER_CHANCE) && !G.debris.some((d) => d.type === 'note')) {
     type = 'note';
   }
   if (!forceType && type !== 'note' && chance(0.035)) type = 'crate';
-  if (type === 'note') F.noteDay = G.day;
 
   const T = TYPES[type];
   const d = {
@@ -184,6 +197,7 @@ export function spawnDebrisNear(G, x, n = 4) {
 }
 
 const safeWaterY = (G, x) => { const y = waterY(G, x); return isFinite(y) ? y : 0; };
+const UP_NEAR = 420, UP_WANT = 7;   // anchored/beached: keep ~7 pieces floating within ±420 of the raft
 
 // =====================================================================================
 // update
@@ -205,15 +219,18 @@ export function update(G, dt) {
     spawn(G, D.cursor + rand(-15, 15));
   }
 
-  // ---- anchored or beached: the current keeps bringing things from upstream
+  // ---- anchored or beached: the current keeps bringing things from upstream. Only what
+  // is still floating free near the raft counts (not what lies on the seabed, hangs on the
+  // hook or drifts far away), so the supply never dries up while the boy is on an island.
   const slow = !(Math.abs(R.vx || 0) > 2);
   if (slow) {
     D.upT -= dt;
     if (D.upT <= 0) {
-      D.upT = rand(7, 11);
+      D.upT = rand(4, 7);
+      const a = rx - UP_NEAR, b = rx + raftLen(G) + UP_NEAR;
       let near = 0;
-      for (const d of G.debris) if (!d.attached && d.x > rx - W * 0.7 && d.x < rx + W * 0.9) near++;
-      if (near < 9) spawn(G, rx - W * 0.55 - rand(0, 80));
+      for (const d of G.debris) if (!d.attached && !d.rest && d.type !== 'crate' && d.x > a && d.x < b) near++;
+      if (near < UP_WANT) spawn(G, rx - W * 0.55 - rand(0, 80));
     }
   }
   // the odd crate drifting under the surface
@@ -312,10 +329,7 @@ export function update(G, dt) {
 
     // ---- despawn
     const far = d.x < rx - 900 || d.x > rx + W * 1.5 + 500 || (d.rest && d.restT > 90) || d.y > 1500;
-    if (far) {
-      if (d.type === 'note') { const F = flags(G); if (F.noteDay === G.day) F.noteDay = -1; }
-      continue;
-    }
+    if (far) continue;
     arr[w++] = d;
   }
   arr.length = w;
@@ -397,6 +411,7 @@ function readLetter(G) {
   journal(G, '漂流瓶里的信（' + (i + 1) + '/' + LETTERS.length + '）：「' + text + '」');
   const first = text.split(/[。！？]/)[0];
   say(G, '漂流瓶里有一封信：「' + (first.length > 22 ? first.slice(0, 21) + '……' : first + '……') + '」', 'story');
+  if (i === 0) say(G, hint('信收进了日记里，按 J 可以从头读。', '信收进了日记里，点「图鉴」可以从头读。'), 'info');
   sfx('discover');
 }
 
