@@ -187,7 +187,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         raw_fish: 0,
         cooked_fish: 0,
         can: 0,
-        water: 1,
+        water: 3,
         berry: 0
       },
       codex: {},
@@ -482,6 +482,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         if (key && key.startsWith("tool")) input.toolPressed = Number(key.slice(4)) || 0;
     }
   }
+  var hint = (keyboard, touch) => input.touch ? touch : keyboard;
   function endInputFrame() {
     input.usePressed = false;
     input.useReleased = false;
@@ -5597,6 +5598,8 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     spawnDebrisNear: () => spawnDebrisNear,
     update: () => update2
   });
+  var LETTER_STEP = 2500;
+  var LETTER_CHANCE = 0.15;
   var LETTERS = [
     "如果你看到这封信……说明海上不止我一个人。我叫小满，今年十二岁。暴风雨那天晚上船翻了，我抱着一只木箱漂到了天亮。你也是这样吗？",
     "第三天。我用捡来的木板和绳子绑了一只歪歪扭扭的木筏。淡水快喝完了，我学会了用塑料布接雨水。你也要记得接雨水，还有，别喝海水。",
@@ -5659,7 +5662,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       case "frond":
         return [["leaf", randi(1, 2)]];
       case "barrel":
-        return mixedLoot(randi(3, 5), 0.3, 0);
+        return mixedLoot(randi(3, 5), 0.3, 0.25);
       case "crate":
         return mixedLoot(randi(4, 6), 0.4, 0.25);
       case "note":
@@ -5714,17 +5717,20 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
     return g != null && isFinite(g) ? g : null;
   }
+  function letterDue(G2) {
+    const k = flags(G2).notes | 0;
+    const rx = G2.raft && isFinite(G2.raft.x) ? G2.raft.x : 0;
+    return k < LETTERS.length && rx > k * LETTER_STEP;
+  }
   function spawn(G2, x, forceType, initial) {
     if (!isFinite(x)) return null;
     const land = landAt(G2, x);
     if (land != null && land < 14) return null;
     let type = forceType || chooseType();
-    const F = flags(G2);
-    if (!forceType && !G2.demo && !initial && F.noteDay !== G2.day && (F.notes | 0) < LETTERS.length && G2.phase > 0.08 && G2.phase < 0.9 && chance(0.07) && !G2.debris.some((d2) => d2.type === "note")) {
+    if (!forceType && !G2.demo && !initial && letterDue(G2) && G2.phase > 0.08 && G2.phase < 0.9 && chance(LETTER_CHANCE) && !G2.debris.some((d2) => d2.type === "note")) {
       type = "note";
     }
     if (!forceType && type !== "note" && chance(0.035)) type = "crate";
-    if (type === "note") F.noteDay = G2.day;
     const T2 = TYPES[type];
     const d = {
       id: uid++,
@@ -5775,6 +5781,8 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     const y = waterY(G2, x);
     return isFinite(y) ? y : 0;
   };
+  var UP_NEAR = 420;
+  var UP_WANT = 7;
   function update2(G2, dt) {
     if (!G2.debris || !G2.debrisState) init3(G2);
     const D = G2.debrisState, R = G2.raft, W = viewW(G2);
@@ -5792,10 +5800,11 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     if (slow) {
       D.upT -= dt;
       if (D.upT <= 0) {
-        D.upT = rand(7, 11);
+        D.upT = rand(4, 7);
+        const a = rx - UP_NEAR, b = rx + raftLen(G2) + UP_NEAR;
         let near = 0;
-        for (const d of G2.debris) if (!d.attached && d.x > rx - W * 0.7 && d.x < rx + W * 0.9) near++;
-        if (near < 9) spawn(G2, rx - W * 0.55 - rand(0, 80));
+        for (const d of G2.debris) if (!d.attached && !d.rest && d.type !== "crate" && d.x > a && d.x < b) near++;
+        if (near < UP_WANT) spawn(G2, rx - W * 0.55 - rand(0, 80));
       }
     }
     D.crateT -= dt;
@@ -5888,13 +5897,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         addLight(G2, d.x, d.y - 3, 22, [240, 230, 200], 0.35 + 0.15 * Math.sin(t * 2.3 + d.seed));
       }
       const far = d.x < rx - 900 || d.x > rx + W * 1.5 + 500 || d.rest && d.restT > 90 || d.y > 1500;
-      if (far) {
-        if (d.type === "note") {
-          const F = flags(G2);
-          if (F.noteDay === G2.day) F.noteDay = -1;
-        }
-        continue;
-      }
+      if (far) continue;
       arr[w++] = d;
     }
     arr.length = w;
@@ -5971,6 +5974,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     journal(G2, "漂流瓶里的信（" + (i + 1) + "/" + LETTERS.length + "）：「" + text + "」");
     const first = text.split(/[。！？]/)[0];
     say(G2, "漂流瓶里有一封信：「" + (first.length > 22 ? first.slice(0, 21) + "……" : first + "……") + "」", "story");
+    if (i === 0) say(G2, hint("信收进了日记里，按 J 可以从头读。", "信收进了日记里，点「图鉴」可以从头读。"), "info");
     sfx("discover");
   }
   function splash(G2, d, n) {
@@ -6997,6 +7001,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
   var ACC_AIR = 430;
   var JUMP_V = Math.sqrt(2 * C.GRAVITY * 40);
   var STEP_UP = 9;
+  var STEP_RAFT = STEP_UP + 7;
   var WADE_MAX = 17;
   var SWIM_SURF = 48;
   var SWIM_DEEP = 64;
@@ -7012,7 +7017,11 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
   var CHARGE_TIME = 0.8;
   var SPEAR_CD = 0.45;
   var SPEAR_CD_WATER = 0.62;
-  var SPEAR_REACH = 26;
+  var SPEAR_REACH = 34;
+  var SPEAR_R = 14;
+  var SWIM_IDLE_RISE = 3;
+  var HP_REGEN = 0.25;
+  var CLIMB_SLACK = 3;
   var RAFT_UNDER = 12;
   var FOODS = ["cooked_fish", "can", "coconut", "berry", "raw_fish"];
   var TOOLS = ["hook", "spear", "hammer", "hand"];
@@ -7100,6 +7109,28 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
   }
   var topAt = (G2, x) => ground(G2, x, -1e9);
+  function isleY(G2, x) {
+    try {
+      const y = groundAt(G2, x);
+      return Number.isFinite(y) ? y : null;
+    } catch (e) {
+      oops2("islands.groundAt", e);
+      return null;
+    }
+  }
+  function floorAt(G2, x, fromY = -1e9) {
+    let best = null;
+    const i = isleY(G2, x);
+    if (i != null && i >= fromY - 2) best = { y: i, kind: "island" };
+    let s = null;
+    try {
+      s = seabedY(G2, x);
+    } catch (e) {
+      oops2("seabedY", e);
+    }
+    if (Number.isFinite(s) && s >= fromY - 2 && (!best || s < best.y)) best = { y: s, kind: "seabed" };
+    return best;
+  }
   function surfaceTop(G2, x) {
     const wy3 = waterY(G2, x);
     const t = topAt(G2, x);
@@ -7151,6 +7182,8 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       spearCD: 0,
       reelT: 0,
       climb: null,
+      airCarry: 0,
+      frozen: false,
       warn: { o2: false, far: false, hunger: false, thirst: false, nohook: false },
       lantern: false,
       cause: "",
@@ -7180,6 +7213,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     };
   }
   var rt2 = (G2) => G2.playerRt || (G2.playerRt = newRt(G2));
+  var ctl = { up: false, down: false, use: false };
   function init4(G2) {
     const P = G2.player;
     if (!P) return;
@@ -7215,8 +7249,13 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     R.swingT += dt;
     R.eatT += dt;
     R.spearCD = Math.max(0, R.spearCD - dt);
+    R.frozen = !!(G2.raft && G2.raft.busy);
+    ctl.up = !R.frozen && input.up;
+    ctl.down = !R.frozen && input.down;
+    ctl.use = !R.frozen && input.use;
     R.jumpBuf = Math.max(0, R.jumpBuf - dt);
-    if (input.jumpPressed) R.jumpBuf = 0.13;
+    if (R.frozen) R.jumpBuf = 0;
+    else if (input.jumpPressed) R.jumpBuf = 0.13;
     const span = raftSpan(G2);
     if (span && span.y == null && R.mode !== "swim" && P.x >= span.x0 - 2 && P.x <= span.x1 + 2 && P.y <= 1) {
       R.lastX = P.x;
@@ -7226,9 +7265,9 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
     if (R.fresh || Math.abs(P.x - R.lastX) > 40 || Math.abs(P.y - R.lastY) > 40) classify(G2, P, R);
     R.fresh = false;
-    if (input.toolPressed) selectTool(G2, P, R, input.toolPressed);
+    if (input.toolPressed && !R.frozen) selectTool(G2, P, R, input.toolPressed);
     if (P.tool === "spear" && !(has(G2, "spear") > 0)) P.tool = "hand";
-    const dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    const dir = R.frozen ? 0 : (input.right ? 1 : 0) - (input.left ? 1 : 0);
     const busy = R.charging || G2.hook && G2.hook.state === "reeling" && !G2.hook.fast || R.spear && R.mode !== "swim";
     const mul = (busy ? 0.55 : 1) * (tired(P) ? 0.82 : 1);
     if (dir && R.mode !== "climb" && !R.charging && !(R.spear && R.spear.t < R.spear.dur)) P.facing = dir;
@@ -7242,7 +7281,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       P.y = R.lastY;
       P.vx = P.vy = 0;
     }
-    unstick(G2, P, R);
+    unstick(G2, P, R, dt);
     const wy3 = waterY(G2, P.x);
     R.depth = Math.max(0, P.y - wy3);
     const head = headPos(P, R);
@@ -7257,12 +7296,14 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     breathe(G2, P, R, dt);
     survive(G2, P, R, dt);
     if (R.mode !== "climb") {
-      hookInput(G2, P, R, dt);
-      spearAndHammer(G2, P, R, dt);
-      eatDrink(G2, P, R);
+      const act = !R.frozen;
+      if (act) hookInput(G2, P, R, dt);
+      else R.charging = false;
+      spearAndHammer(G2, P, R, dt, act);
+      if (act) eatDrink(G2, P, R);
     } else R.charging = false;
     updateHook(G2, P, R, dt);
-    pickInteractable(G2, P, R);
+    if (!R.frozen) pickInteractable(G2, P, R);
     lights(G2, P, R);
     effects(G2, P, R, dt);
     farFromRaft(G2, P, R);
@@ -7294,21 +7335,35 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     const c = Math.cos(rot2), s = Math.abs(Math.sin(rot2));
     return { up: Math.max(19 * c, -9.5 * c) + 3.5 * s, down: Math.max(9.5 * c, -19 * c) + 3.5 * s };
   }
-  function unstick(G2, P, R) {
+  function unstick(G2, P, R, dt) {
     if (R.mode === "climb") return;
-    const top = topAt(G2, P.x);
-    if (!top || top.kind !== "island" || P.y - PELVIS * 0.6 <= top.y) return;
-    P.y = top.y;
+    const iy = isleY(G2, P.x);
+    if (iy == null || P.y - PELVIS * 0.6 <= iy) return;
+    const d = deck(G2, P.x);
+    if (d != null && d < iy) {
+      const span = raftSpan(G2);
+      const ex = extents(R.mode === "swim" ? R.rot : 0);
+      const lim = R.mode === "swim" ? iy + PELVIS - ex.down : iy;
+      if (P.y <= lim + 0.5) return;
+      P.y = lim;
+      if (P.vy > 0) P.vy = 0;
+      const c = raftCeil(G2, span, P.x, ex);
+      if (span && c != null && c > lim) escapeRaft(G2, P, span, dt);
+      return;
+    }
+    P.y = iy;
     if (P.vy > 0) P.vy = 0;
-    if (top.y - waterY(G2, P.x) < WADE_MAX) {
+    if (iy - waterY(G2, P.x) < WADE_MAX) {
       R.mode = "ground";
       R.gk = "island";
       R.under = false;
       R.rot = 0;
+      R.airCarry = 0;
     }
   }
   function classify(G2, P, R) {
     R.climb = null;
+    R.airCarry = 0;
     const wy3 = waterY(G2, P.x);
     const g = ground(G2, P.x, P.y - STEP_UP);
     if (g && g.y - P.y < 12 && g.y - wy3 < WADE_MAX) {
@@ -7338,11 +7393,12 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       nx = P.x + carry * dt;
       P.vx = 0;
     }
-    let g = ground(G2, nx, P.y - STEP_UP);
-    if (g && g.y < P.y - (g.kind === "raft" ? STEP_UP : 2 + Math.abs(dx) * 2.4)) {
+    const reach = R.gk === "island" ? STEP_RAFT : STEP_UP;
+    let g = ground(G2, nx, P.y - reach);
+    if (g && g.y < P.y - (g.kind === "raft" ? reach : 2 + Math.abs(dx) * 2.4)) {
       nx = P.x + carry * dt;
       P.vx = 0;
-      g = ground(G2, nx, P.y - STEP_UP);
+      g = ground(G2, nx, P.y - reach);
     }
     P.x = nx;
     if (g && g.y <= P.y + 5 + Math.abs(dx) * 2.5) {
@@ -7353,6 +7409,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       R.mode = "air";
       R.coyote = 0.1;
       P.vy = 0;
+      R.airCarry = carry;
       return;
     }
     const depth = P.y - waterY(G2, P.x);
@@ -7360,6 +7417,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       R.mode = "swim";
       R.under = false;
       R.rot = 0;
+      R.airCarry = 0;
       return;
     }
     if (R.jumpBuf > 0) {
@@ -7367,6 +7425,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       P.vy = -JUMP_V * (wade > 0.4 ? 0.75 : 1);
       R.mode = "air";
       R.coyote = 0;
+      R.airCarry = carry;
       play2("jump");
       if (depth > 2) splash2(G2, P.x, 0.35, false);
       return;
@@ -7393,14 +7452,16 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
     P.vx = approach(P.vx, dir * WALK * mul, ACC_AIR * dt);
     P.vy += C.GRAVITY * dt;
-    if (P.vy < 0 && !input.up) P.vy += C.GRAVITY * 1.3 * dt;
+    if (P.vy < 0 && !ctl.up) P.vy += C.GRAVITY * 1.3 * dt;
     if (P.vy > 560) P.vy = 560;
-    let nx = P.x + P.vx * dt;
+    const carry = Number.isFinite(R.airCarry) ? R.airCarry : 0;
+    let nx = P.x + (P.vx + carry) * dt;
     const ny = P.y + P.vy * dt;
     const t1 = topAt(G2, nx);
     if (t1 && t1.kind === "island" && t1.y < Math.min(P.y, ny) - 3) {
       nx = P.x;
       P.vx = 0;
+      R.airCarry = 0;
     }
     if (P.vy >= 0) {
       const g = ground(G2, nx, P.y);
@@ -7409,6 +7470,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         P.y = g.y;
         R.gk = g.kind;
         R.mode = "ground";
+        R.airCarry = 0;
         R.landPow = clamp(P.vy / 420, 0, 1);
         R.landT = 0;
         if (P.vy > 120) play2("step", { surface: g.kind, volume: 0.55 + 0.45 * R.landPow });
@@ -7422,8 +7484,10 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
   }
   function enterWater(G2, P, R) {
     const v = Math.abs(P.vy);
+    P.vx += Number.isFinite(R.airCarry) ? R.airCarry : 0;
+    R.airCarry = 0;
     R.mode = "swim";
-    R.under = !!input.down;
+    R.under = !!ctl.down;
     R.rot = R.under ? 0.5 : 0;
     splash2(G2, P.x, clamp(v / 300, 0.3, 1.3), true);
     play2("splash", { volume: clamp(v / 320, 0.35, 1) });
@@ -7454,7 +7518,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       nx = swimWall(G2, P, nx);
       P.x = nx;
       P.y += P.vy * dt;
-      if (input.down && R.jumpBuf <= 0) {
+      if (ctl.down && R.jumpBuf <= 0) {
         R.under = true;
         P.vy = Math.max(P.vy, 55);
         play2("dive");
@@ -7462,44 +7526,51 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         splash2(G2, P.x, 0.3, false);
       }
     } else {
-      const iy = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+      const iy = (ctl.down ? 1 : 0) - (ctl.up ? 1 : 0);
       const len = Math.hypot(dir, iy) || 1;
       const sp = SWIM_DEEP * flip * mul;
       P.vx = approach(P.vx, dir / len * sp, (dir ? 230 : 110) * dt);
-      P.vy = approach(P.vy, iy ? iy / len * sp : -8, (iy ? 230 : 70) * dt);
+      P.vy = approach(P.vy, iy ? iy / len * sp : -SWIM_IDLE_RISE, (iy ? 230 : 70) * dt);
       const spd2 = Math.hypot(P.vx, P.vy);
       const surge = spd2 > 15 ? 0.84 + 0.32 * Math.max(0, Math.sin(R.swimPh * TAU)) : 1;
       let nx = P.x + P.vx * dt * surge;
-      const tRot = spd2 > 14 ? Math.atan2(Math.abs(P.vx), -P.vy) : 0.25;
+      let tRot = spd2 > 14 ? Math.atan2(Math.abs(P.vx), -P.vy) : 0.25;
+      if (raftRoom(G2, span, P.x, extents(tRot)) < 0) tRot = Math.PI / 2;
       R.rot += (tRot - R.rot) * Math.min(1, dt * 5);
       nx = swimWall(G2, P, nx);
+      if (span && span.y != null && nx !== P.x) {
+        const exm = extents(R.rot);
+        const r1 = raftRoom(G2, span, nx, exm);
+        if (r1 < 0 && r1 < raftRoom(G2, span, P.x, exm) - 0.01) {
+          nx = P.x;
+          P.vx *= 0.2;
+        }
+      }
       P.x = nx;
       P.y += P.vy * dt * surge;
     }
     const ex = extents(R.rot);
-    const fl = ground(G2, P.x, P.y - PELVIS);
-    if (fl && fl.kind !== "raft") {
-      const lim = fl.y + PELVIS - ex.down;
-      if (P.y > lim) {
-        P.y = lim;
-        if (P.vy > 0) P.vy = 0;
-      }
+    const fl = floorAt(G2, P.x, P.y - PELVIS);
+    const flim = fl ? fl.y + PELVIS - ex.down : Infinity;
+    if (P.y > flim) {
+      P.y = flim;
+      if (P.vy > 0) P.vy = 0;
     }
     let underRaft = false;
-    if (span && span.y != null && P.x > span.x0 + 1 && P.x < span.x1 - 1) {
-      const lim = span.y + RAFT_UNDER + PELVIS + ex.up;
-      if (P.y < lim) {
-        P.y = lim;
+    const rlim = raftCeil(G2, span, P.x, ex);
+    if (rlim != null && P.y < rlim) {
+      underRaft = true;
+      R.under = true;
+      if (rlim <= flim) {
+        P.y = rlim;
         if (P.vy < 0) P.vy = 0;
-        underRaft = true;
-        R.under = true;
-      }
+      } else escapeRaft(G2, P, span, dt);
     }
     if (R.under && !underRaft) {
       const hy = P.y - PELVIS - HEAD_UP * Math.cos(R.rot);
       const hx = P.x + P.facing * HEAD_UP * Math.sin(R.rot);
       const hw = waterY(G2, hx);
-      if (hy < hw + 1 && !input.down) {
+      if (hy < hw + 1 && !ctl.down) {
         R.under = false;
         P.vy *= 0.3;
         splash2(G2, hx, 0.35, false);
@@ -7546,6 +7617,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         R.jumpBuf = 0;
         R.mode = "air";
         R.coyote = 0;
+        R.airCarry = 0;
         P.vy = -270;
         P.vx = P.facing * 55;
         play2("jump");
@@ -7555,17 +7627,35 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
   }
   function swimWall(G2, P, nx) {
     if (Math.abs(nx - P.x) < 1e-4) return nx;
-    const t0 = topAt(G2, P.x), t1 = topAt(G2, nx);
-    if (t1 && t1.kind !== "raft" && t1.y < P.y - 3 && (!t0 || t1.y < t0.y - 4)) {
+    const t0 = floorAt(G2, P.x), t1 = floorAt(G2, nx);
+    if (t1 && t1.y < P.y - 3 && (!t0 || t1.y < t0.y - 4)) {
       P.vx *= 0.2;
       return P.x;
     }
     return nx;
   }
+  function raftCeil(G2, span, x, ex) {
+    if (!span || span.y == null || !(x > span.x0 + 1 && x < span.x1 - 1)) return null;
+    const d = deck(G2, x);
+    return (d != null ? d : span.y) + RAFT_UNDER + PELVIS + ex.up;
+  }
+  function raftRoom(G2, span, x, ex) {
+    const c = raftCeil(G2, span, x, ex);
+    if (c == null) return Infinity;
+    const fl = floorAt(G2, x);
+    return fl ? fl.y + PELVIS - ex.down - c : Infinity;
+  }
+  function escapeRaft(G2, P, span, dt) {
+    const a = floorAt(G2, span.x0 - 8), b = floorAt(G2, span.x1 + 8);
+    const side = (a ? a.y : 1e4) >= (b ? b.y : 1e4) ? -1 : 1;
+    P.x += side * 45 * dt;
+    if (P.vx * side < 0) P.vx = 0;
+  }
   function raftEdge(G2, P, R) {
     const span = raftSpan(G2);
     if (!span || span.y == null || R.mode !== "swim") return null;
     if (P.x < span.x0 - 18 || P.x > span.x1 + 18) return null;
+    if (P.x > span.x0 + CLIMB_SLACK && P.x < span.x1 - CLIMB_SLACK) return null;
     const hy = P.y - PELVIS - HEAD_UP * Math.cos(R.rot);
     if (hy - waterY(G2, P.x) > 16) return null;
     const side = P.x < (span.x0 + span.x1) / 2 ? -1 : 1;
@@ -7573,9 +7663,9 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
   }
   function startClimb(G2) {
     const P = G2.player, R = rt2(G2);
-    if (R.mode !== "swim" || R.dead) return;
+    if (R.mode !== "swim" || R.dead || R.frozen) return;
     const span = raftSpan(G2);
-    if (!span || span.y == null) return;
+    if (!span || span.y == null || !raftEdge(G2, P, R)) return;
     const side = P.x < (span.x0 + span.x1) / 2 ? -1 : 1;
     const edge = side < 0 ? span.x0 : span.x1;
     R.climb = { t: 0, side, dx0: clamp(P.x - edge, -6, 6) + side * 3, d0: clamp(P.y - waterY(G2, P.x), 8, 24) };
@@ -7626,7 +7716,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       if (P.oxygen <= 0) P.hp -= DROWN_DPS * dt;
       if (P.oxygen < 30 && !R.warn.o2) {
         R.warn.o2 = true;
-        say(G2, "快没气了！快浮上去换气", "warn");
+        say(G2, hint("快没气了！按住 W 或空格浮上去换气", "快没气了！按住「上」浮上去换气"), "warn");
       }
     } else {
       P.oxygen = Math.min(C.MAX_STAT, P.oxygen + O2_FILL * dt);
@@ -7642,17 +7732,17 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       R.starve = P.thirst <= 0 ? "thirst" : "hunger";
     } else {
       R.starve = "";
-      if (P.hunger > 60 && P.thirst > 60 && P.oxygen > 0) P.hp += 0.6 * dt;
+      if (P.hunger > 60 && P.thirst > 60 && P.oxygen > 0) P.hp += HP_REGEN * dt;
     }
     P.hp = clamp(P.hp, 0, C.MAX_STAT);
     if (P.hunger < 20 && !R.warn.hunger) {
       R.warn.hunger = true;
-      say(G2, "肚子饿得咕咕叫……按 F 吃点东西", "warn");
+      say(G2, FOODS.some((f) => has(G2, f) > 0) ? hint("肚子饿得咕咕叫……按 F 吃点东西", "肚子饿得咕咕叫……点「吃」吃点东西") : "肚子饿得咕咕叫……去钩点漂流物，或者下水抓鱼", "warn");
     }
     if (P.hunger > 35) R.warn.hunger = false;
     if (P.thirst < 20 && !R.warn.thirst) {
       R.warn.thirst = true;
-      say(G2, "嗓子干得冒烟……按 R 喝水", "warn");
+      say(G2, has(G2, "water") > 0 || has(G2, "coconut") > 0 ? hint("嗓子干得冒烟……按 R 喝水", "嗓子干得冒烟……点「喝」喝水") : noWaterText(G2, "嗓子干得冒烟……"), "warn");
     }
     if (P.thirst > 35) R.warn.thirst = false;
   }
@@ -7693,6 +7783,8 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       P.vy -= 25;
     } else if (R.mode === "climb") {
     } else {
+      const span = raftSpan(G2);
+      R.airCarry = R.mode === "ground" && R.gk === "raft" && span ? span.vx : R.mode === "air" ? R.airCarry || 0 : 0;
       P.vx = d * 150;
       P.vy = -150;
       R.mode = "air";
@@ -7709,7 +7801,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     else if (n === 2) {
       if (has(G2, "spear") > 0) next = "spear";
       else {
-        say(G2, "还没有鱼叉——按 Tab 打开背包制作");
+        say(G2, hint("还没有鱼叉——按 Tab 打开背包制作", "还没有鱼叉——点「背包」制作"));
         return;
       }
     } else if (n === 3) {
@@ -7766,7 +7858,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
     if (!R.charging) return;
     if (input.aimFromPointer && Math.abs(input.mouse.wx - P.x) > 4) P.facing = input.mouse.wx > P.x ? 1 : -1;
-    if (input.use) {
+    if (ctl.use) {
       R.charge = Math.min(1, R.charge + dt / CHARGE_TIME);
     } else {
       const o = throwOrigin(G2, P, R);
@@ -7856,9 +7948,9 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         d = ROPE_MAX;
       }
       h3.len = Math.max(d, Math.min(h3.len, d + 50));
-      if (input.use && P.tool === "hook" && !R.charging) h3.state = "reeling";
+      if (ctl.use && P.tool === "hook" && !R.charging) h3.state = "reeling";
     } else if (h3.state === "reeling") {
-      if (!h3.fast && !input.use) h3.state = "floating";
+      if (!h3.fast && !ctl.use) h3.state = "floating";
       else {
         const step2 = (h3.fast ? 430 : REEL_SPEED) * dt;
         const ax = hx - h3.x;
@@ -7906,14 +7998,14 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
     G2.hook = null;
   }
-  function spearAndHammer(G2, P, R, dt) {
+  function spearAndHammer(G2, P, R, dt, act) {
     const under = R.mode === "swim" && R.under;
-    if (P.tool === "spear" && input.usePressed && R.spearCD <= 0 && has(G2, "spear") > 0) {
+    if (act && P.tool === "spear" && input.usePressed && R.spearCD <= 0 && has(G2, "spear") > 0) {
       const sx = P.x + R.off.shoulder[0], sy = P.y + R.off.shoulder[1];
       let a;
       if (input.aimFromPointer && Number.isFinite(input.mouse.wx)) a = Math.atan2(input.mouse.wy - sy, input.mouse.wx - sx);
       else {
-        const iy = R.mode === "swim" ? (input.down ? 1 : 0) - (input.up ? 1 : 0) : 0;
+        const iy = R.mode === "swim" ? (ctl.down ? 1 : 0) - (ctl.up ? 1 : 0) : 0;
         a = Math.atan2(iy * 0.8, P.facing);
       }
       P.facing = Math.cos(a) >= 0 ? 1 : -1;
@@ -7932,12 +8024,27 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         S3.hit = true;
         const sx = P.x + R.off.shoulder[0], sy = P.y + R.off.shoulder[1];
         const tx = sx + Math.cos(S3.a) * SPEAR_REACH, ty = sy + Math.sin(S3.a) * SPEAR_REACH;
-        addHit(G2, tx, ty, 12, 25, "spear", "player");
+        addHit(G2, tx, ty, SPEAR_R, 25, "spear", "player");
         if (ty > waterY(G2, tx)) bubbleBurst(G2, tx, ty, 3);
       }
       if (S3.t >= S3.dur) R.spear = null;
     }
-    if (P.tool === "hammer" && input.usePressed && R.swingT > 0.3) R.swingT = 0;
+    if (act && P.tool === "hammer" && input.usePressed && R.swingT > 0.3) R.swingT = 0;
+  }
+  function noWaterText(G2, lead) {
+    const tiles = G2.raft && Array.isArray(G2.raft.tiles) ? G2.raft.tiles : [];
+    let n = 0, water = 0;
+    for (const t of tiles) {
+      const s = t && t.s;
+      if (s && s.type === "purifier") {
+        n++;
+        water += Number(s.water) > 0 ? Number(s.water) : 0;
+      }
+    }
+    if (water > 0) return lead + hint("净水器里接到了水，走过去按 E 喝", "净水器里接到了水，走过去点「互动」喝");
+    if (n > 0) return lead + "净水器还在收集，白天晒一晒，下雨时会快很多";
+    if (has(G2, "purifier") > 0) return lead + hint("背包里有净水器，按 3 拿锤子把它装到木筏上", "背包里有净水器，拿起锤子把它装到木筏上");
+    return lead + hint("按 Tab 打开背包，造一个净水器吧", "点「背包」造一个净水器吧");
   }
   function eatDrink(G2, P, R) {
     if (input.eatPressed) {
@@ -7960,7 +8067,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       if (R.headUnder) say(G2, "在水下没法喝水");
       else {
         const id = has(G2, "water") > 0 ? "water" : has(G2, "coconut") > 0 ? "coconut" : null;
-        if (!id) say(G2, "没有淡水了……造一个净水器吧");
+        if (!id) say(G2, noWaterText(G2, "没有淡水了……"));
         else {
           let ok = false;
           try {
@@ -20731,7 +20838,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
     return g != null && isFinite(g) ? g : null;
   }
-  function floorAt(G2, x) {
+  function floorAt2(G2, x) {
     let f = seabedY(G2, x);
     if (!isFinite(f)) f = 800;
     const g = islandGround2(G2, x);
@@ -20787,18 +20894,33 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     c.seen = true;
     discover(G2, id);
   }
+  function inSoil(G2, x, y) {
+    const g = islandGround2(G2, x);
+    return g != null && g < y;
+  }
+  function dryLand(G2, x) {
+    const g = islandGround2(G2, x);
+    return g != null && g < wy2(G2, x) + 1;
+  }
   function bubbles2(G2, x, y, n, spread = 6, size = 1.5) {
     for (let i = 0; i < n; i++) {
-      emit(G2, { x: x + rand(-spread, spread), y: y + rand(-spread, spread) * 0.6, vx: rand(-6, 6), vy: rand(-36, -16), life: rand(1, 2.4), size: rand(size * 0.5, size * 1.3), kind: "bubble", color: [215, 238, 248], alpha: 0.75, water: "below" });
+      const bx = x + rand(-spread, spread), by = y + rand(-spread, spread) * 0.6;
+      if (inSoil(G2, bx, by)) continue;
+      emit(G2, { x: bx, y: by, vx: rand(-6, 6), vy: rand(-36, -16), life: rand(1, 2.4), size: rand(size * 0.5, size * 1.3), kind: "bubble", color: [215, 238, 248], alpha: 0.75, water: "below" });
     }
   }
   function splash3(G2, x, n, power = 1) {
+    if (dryLand(G2, x)) return;
     const y = wy2(G2, x);
     for (let i = 0; i < n; i++) {
-      emit(G2, { x: x + rand(-6, 6) * power, y: y - 1, vx: rand(-40, 40) * power, vy: rand(-120, -40) * power, life: rand(0.5, 1), size: rand(1, 2.4), gravity: 300, color: [232, 244, 248], alpha: 0.85, water: "above" });
+      const sx = x + rand(-6, 6) * power;
+      if (i && dryLand(G2, sx)) continue;
+      emit(G2, { x: sx, y: y - 1, vx: rand(-40, 40) * power, vy: rand(-120, -40) * power, life: rand(0.5, 1), size: rand(1, 2.4), gravity: 300, color: [232, 244, 248], alpha: 0.85, water: "above" });
     }
     for (let i = 0; i < Math.ceil(n / 3); i++) {
-      emit(G2, { x: x + rand(-8, 8) * power, y: y + rand(2, 6), vx: rand(-10, 10), vy: rand(-12, 4), life: rand(0.8, 1.6), size: rand(1, 2), kind: "bubble", color: [220, 240, 250], alpha: 0.7, water: "below" });
+      const bx = x + rand(-8, 8) * power, by = y + rand(2, 6);
+      if (inSoil(G2, bx, by)) continue;
+      emit(G2, { x: bx, y: by, vx: rand(-10, 10), vy: rand(-12, 4), life: rand(0.8, 1.6), size: rand(1, 2), kind: "bubble", color: [220, 240, 250], alpha: 0.7, water: "below" });
     }
   }
   function init10(G2) {
@@ -20862,7 +20984,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     if (at) y = at.y;
     else if (B.y < 30) y = rand(Math.max(55, sp.depth[0]), Math.min(sp.depth[1], 210));
     else y = clamp(B.y + rand(-170, 170), sp.depth[0], sp.depth[1]);
-    const fl = floorAt(G2, x);
+    const fl = floorAt2(G2, x);
     if (fl < 45) return null;
     y = clamp(y, 24, fl - 22);
     const n = randi(sp.n[0], sp.n[1]);
@@ -20944,6 +21066,10 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       emit(G2, { x: f.x, y: f.y, vx: rand(-40, 40), vy: rand(-40, 30), life: rand(0.5, 1.1), size: rand(0.6, 1.3), drag: 3, color: f.sp === "lantern" ? GLOW_CYAN : [225, 236, 240], alpha: 0.9, kind: f.sp === "lantern" ? "glow" : "dot", water: "below" });
     }
   }
+  var FLEE_R = 60;
+  var FLEE_SPEED = 20;
+  var FLEE_CLOSE = 32;
+  var PANIC_MAX = 52;
   function stepSchool(G2, s, dt, B) {
     const sp = SPECIES[s.sp], fish = s.fish, n = fish.length;
     if (!n) return;
@@ -20963,7 +21089,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     s.cy = cy;
     s.wt += dt;
     s.panic = Math.max(0, s.panic - dt);
-    const fl = floorAt(G2, cx);
+    const fl = floorAt2(G2, cx);
     let tx, ty;
     const lanternCall = s.sp === "lantern" && B.inWater && B.lantern && Math.hypot(cx - B.cx, cy - B.cy) < 280;
     if (lanternCall) {
@@ -20989,7 +21115,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
     const t = G2.time;
     const sepR = sp.L * 1.15;
-    const fleeR = 84;
+    const fleeR = FLEE_R;
     const cruise = sp.speed * (lanternCall ? 1.1 : 1);
     for (let i = 0; i < n; i++) {
       const f = fish[i];
@@ -21013,7 +21139,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         const dx = f.x - B.cx, dy = f.y - B.cy;
         if (dx < fleeR && dx > -fleeR && dy < fleeR && dy > -fleeR) {
           const d = Math.hypot(dx, dy) || 1;
-          if (d < fleeR && (B.speed > 8 || d < 40)) {
+          if (d < fleeR && (B.speed > FLEE_SPEED || d < FLEE_CLOSE)) {
             const k = (1 - d / fleeR) * 1100;
             ax += dx / d * k;
             ay += dy / d * k;
@@ -21021,14 +21147,14 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
           }
         }
       }
-      const fy = floorAt(G2, f.x);
+      const fy = floorAt2(G2, f.x);
       const surf2 = wy2(G2, f.x) + 14;
       if (f.y < surf2 + 10) ay += (surf2 + 10 - f.y) * 9;
       if (f.y > fy - 16) ay -= (f.y - fy + 16) * 9;
       f.vx += ax * dt;
       f.vy += ay * dt;
       f.vy *= 1 - Math.min(1, dt * 1.2);
-      const maxS = cruise * (s.panic > 0 ? 3.4 : 1.5), minS = cruise * 0.35;
+      const maxS = s.panic > 0 ? Math.min(cruise * 3.4, PANIC_MAX) : cruise * 1.5, minS = cruise * 0.35;
       const spd = Math.hypot(f.vx, f.vy) || 0.01;
       if (spd > maxS) {
         f.vx *= maxS / spd;
@@ -21055,6 +21181,9 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
   }
   var SHARK_L = 96;
+  var LAMP_PATROL = 250;
+  var LAMP_CLEAR = 190;
+  var lampGuarding = (G2) => !!(G2.raft && G2.raft.lampLit) && isDark(G2);
   function makeShark(G2, x, y, dir) {
     return {
       kind: "shark",
@@ -21100,11 +21229,12 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       }
       return;
     }
-    const shallow = floorAt(G2, mid) < 130;
+    const shallow = floorAt2(G2, mid) < 130;
+    const lampGuard = lampGuarding(G2);
     const home = shallow ? mid - W * 0.6 : mid;
     const sx = c.x + c.face * SHARK_L * 0.44 * Math.cos(c.pitch), sy = c.y + Math.sin(c.pitch) * SHARK_L * 0.44;
     const boyD = Math.hypot(B.cx - c.x, B.cy - c.y);
-    const boyNear = B.inWater && boyD < 460 && floorAt(G2, B.x) > 70;
+    const boyNear = B.inWater && boyD < 460 && floorAt2(G2, B.x) > 70;
     if (c.invuln <= 0) {
       for (const h3 of spearHits(G2)) {
         const ax = c.x - c.face * SHARK_L * 0.45, bx = c.x + c.face * SHARK_L * 0.45;
@@ -21136,12 +21266,13 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
           c.depthT = rand(5, 11);
           c.surf = chance(0.55);
         }
-        const R0 = half + 120;
+        const R0 = half + (lampGuard ? LAMP_PATROL : 120);
         if (c.side > 0 && c.x > home + R0 - 25 || c.side < 0 && c.x < home - R0 + 25) c.side = -c.side;
         tx = home + c.side * (R0 + 40);
         ty = c.surf ? 17 : 52 + Math.sin(c.st * 0.3) * 30;
         want = c.surf ? 36 : 44;
-        c.biteT -= dt;
+        if (lampGuard) c.biteT = Math.max(c.biteT, 30);
+        else c.biteT -= dt * (isDark(G2) ? 1.7 : 1);
         if (boyNear && c.cd <= 0) {
           c.state = "stalk";
           c.st = 0;
@@ -21162,7 +21293,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         }
         c.orbit += dt * 0.55 * c.dir;
         tx = B.cx + Math.cos(c.orbit) * 115;
-        ty = clamp(B.cy + Math.sin(c.orbit) * 45, 20, floorAt(G2, B.cx) - 30);
+        ty = clamp(B.cy + Math.sin(c.orbit) * 45, 20, floorAt2(G2, B.cx) - 30);
         want = 55;
         if (c.st > 3.5 && boyD < 230 && boyD > 60 && chance(dt * 0.9)) {
           c.state = "lunge";
@@ -21196,7 +21327,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       case "retreat": {
         const away = sgn(c.x - B.cx) || c.dir;
         tx = c.x + away * 200;
-        ty = Math.min(floorAt(G2, c.x) - 40, 150);
+        ty = Math.min(floorAt2(G2, c.x) - 40, 150);
         want = 120;
         if (c.st > 3.2) {
           c.state = "patrol";
@@ -21208,7 +21339,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       case "flee": {
         const away = sgn(c.x - mid) || 1;
         tx = c.x + away * 400;
-        ty = Math.min(floorAt(G2, c.x) - 40, 320);
+        ty = Math.min(floorAt2(G2, c.x) - 40, 320);
         want = 190;
         if (c.st > 2 && !onScreen(G2, c.x, c.y, SHARK_L)) {
           c.hidden = true;
@@ -21226,6 +21357,12 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
           c.st = 0;
           break;
         }
+        if (lampGuard) {
+          c.state = "patrol";
+          c.st = 0;
+          c.biteT = rand(30, 50);
+          break;
+        }
         const edge = c.biteSide < 0 ? R.x : R.x + raftLen2(G2);
         tx = edge + c.biteSide * (SHARK_L * 0.9);
         ty = 34;
@@ -21237,6 +21374,12 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         break;
       }
       case "biteRush": {
+        if (lampGuard) {
+          c.state = "retreat";
+          c.st = 0;
+          c.biteT = rand(30, 50);
+          break;
+        }
         const edge = c.biteSide < 0 ? R.x : R.x + raftLen2(G2);
         tx = edge - c.biteSide * 6;
         ty = 7;
@@ -21289,7 +21432,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     return finishShark(G2, c, dt);
   }
   function finishShark(G2, c, dt) {
-    const fl = floorAt(G2, c.x);
+    const fl = floorAt2(G2, c.x);
     const minY = c.state === "chomp" ? 6 : 14;
     if (c.y < minY) c.y += (minY - c.y) * Math.min(1, dt * 6);
     if (c.y > fl - 26) c.y = fl - 26;
@@ -21394,10 +21537,12 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     return c;
   }
   var WHALE_L = 560;
+  var WHALE_DEEP = 265;
+  var WHALE_APEX = 104;
   function spawnWhale(G2, dir, x) {
     dir = dir || (chance(0.5) ? 1 : -1);
     const W = viewW2(G2);
-    const c = { kind: "whale", layer: "deep", x: x != null ? x : G2.cam.x - dir * (W * 0.5 + WHALE_L * 0.55), y: 285, dir, t: 0, seen: false, major: true, sang: 0, fin: 0, tail: 0, pitch: 0, dark: 0 };
+    const c = { kind: "whale", layer: "deep", x: x != null ? x : G2.cam.x - dir * (W * 0.5 + WHALE_L * 0.55), y: WHALE_DEEP, dir, t: 0, seen: false, major: true, sang: 0, fin: 0, tail: 0, pitch: 0, dark: 0 };
     G2.creatures.push(c);
     G2.persist.life.whaleDay = G2.day;
     sfx("whale");
@@ -21409,10 +21554,13 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     const jellies = [];
     const n = randi(11, 15);
     const cols = [[110, 220, 255], [255, 140, 220], [180, 150, 255], [140, 255, 210], [120, 200, 255]];
+    const lamp = lampGuarding(G2), mid = raftMid(G2), clear = raftLen2(G2) / 2 + LAMP_CLEAR;
+    const lit = (x) => lamp && Math.abs(x - mid) < clear;
     for (let i = 0; i < n; i++) {
       let x = ax + rand(-360, 360);
-      for (let tries = 0; tries < 8 && floorAt(G2, x) < 90; tries++) x = ax + rand(-360, 360);
-      const fl = floorAt(G2, x);
+      for (let tries = 0; tries < 8 && (floorAt2(G2, x) < 90 || lit(x)); tries++) x = ax + rand(-360, 360);
+      if (lit(x)) x = mid + (x < mid ? -1 : 1) * (clear + rand(10, 220));
+      const fl = floorAt2(G2, x);
       if (fl < 90) continue;
       const ty = clamp(rand(28, 160), 20, fl - 40);
       jellies.push({
@@ -21448,13 +21596,27 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
   }
   function spawnMoonWhale(G2) {
-    const cel = moonInfo(G2);
     const W = G2.view.cssW || 1280;
-    let fx = 0.64;
-    if (cel && cel.moonVisible && isFinite(cel.moonX)) fx = cel.moonX / W;
-    if (Math.abs(fx - 0.5) < 0.14) fx = 0.5 + (fx < 0.5 ? -1 : 1) * rand(0.14, 0.22);
-    fx = clamp(fx, 0.12, 0.88);
-    const c = { kind: "moon_whale", layer: "horizon", t: 0, dur: 11, fx, cx0: G2.cam.x, side: chance(0.5) ? 1 : -1, drops: [], seen: false, major: true, hit: false, sang: false, spray: 0 };
+    const mb = moonBreach(G2);
+    const fx = mb ? clamp(mb.x / W, 0.03, 0.97) : 0.64;
+    const c = {
+      kind: "moon_whale",
+      layer: "horizon",
+      t: 0,
+      dur: 11,
+      fx,
+      cx0: G2.cam.x,
+      side: chance(0.5) ? 1 : -1,
+      drops: [],
+      seen: false,
+      major: true,
+      hit: false,
+      sang: false,
+      spray: 0,
+      k: mb ? mb.k : 1,
+      lift: mb ? mb.lift : MW_LIFT0,
+      track: !!mb
+    };
     G2.creatures.push(c);
     return c;
   }
@@ -21482,7 +21644,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
   function spawnAngler(G2, B, x, y) {
     const side = x != null ? sgn(x - B.x) : chance(0.5) ? 1 : -1;
     x = x != null ? x : B.x + side * rand(210, 260);
-    const fl = floorAt(G2, x);
+    const fl = floorAt2(G2, x);
     y = y != null ? y : clamp(B.cy + rand(10, 80), 110, fl - 50);
     const dir = -side;
     const c = { kind: "angler", layer: "main", x, y, dir, face: dir, state: "lure", st: 0, t: 0, jaw: 0, attacks: 0, lureA: 0, life: rand(50, 75), seen: false, flash: 0 };
@@ -21560,11 +21722,11 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
     L.eyeCool -= dt;
     if (B.inWater && L.eyeCool <= 0 && !has2(G2, "deep_eye") && chance(dt * 0.25)) {
-      const fl = floorAt(G2, B.x);
+      const fl = floorAt2(G2, B.x);
       if (fl > 360 && fl - B.y < 170) {
         const P = G2.player;
         const ex = B.x + (P && P.facing || 1) * rand(90, 190);
-        if (floorAt(G2, ex) > 360 && islandGround2(G2, ex) == null) {
+        if (floorAt2(G2, ex) > 360 && islandGround2(G2, ex) == null) {
           spawnEye(G2, ex);
           L.eyeCool = rand(45, 70);
         }
@@ -21576,7 +21738,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     const w = (k, v) => {
       if (v > 0 && k !== L.last) cand.push([k, v * (G2.codex[k] ? 1 : 2.5)]);
     };
-    const deepBelow = floorAt(G2, raftMid(G2)) > 430 && islandGround2(G2, raftMid(G2) + 400) == null && islandGround2(G2, raftMid(G2) - 400) == null;
+    const deepBelow = floorAt2(G2, raftMid(G2)) > 430 && islandGround2(G2, raftMid(G2) + 400) == null && islandGround2(G2, raftMid(G2) - 400) == null;
     const wet = stormy(G2) ? 0.25 : 1;
     if (dayTime) {
       w("flying_fish", 3 * wet);
@@ -21591,8 +21753,8 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     } else if (isDark(G2)) {
       w("jelly", 3);
       if (!has2(G2, "plankton")) w("plankton", 2.4);
-      const cel = moonInfo(G2);
-      if (cel && cel.moonVisible && G2.view.seaScreenY > 80) w("moon_whale", 1.7);
+      const mb = moonBreach(G2);
+      if (mb && mb.ok && G2.view.seaScreenY > 80) w("moon_whale", mb.k < 1.5 ? 2.6 : 1.9);
       if (G2.day >= 2 && G2.day - PL.levDay >= 2 && G2.view.seaScreenY > 120) w("leviathan", 0.9);
     }
     if (!cand.length) {
@@ -21669,6 +21831,11 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         continue;
       }
       const w = wy2(G2, f.x);
+      const g = islandGround2(G2, f.x);
+      if (g != null && (f.y > g - 3 || f.mode !== "air" && g < w + 1)) {
+        f.gone = true;
+        continue;
+      }
       if (f.mode === "swim") {
         f.x += f.vx * dt;
         f.vy += (-70 - f.vy) * Math.min(1, dt * 3);
@@ -21773,7 +21940,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
     const ty = near ? 10 : c.base + Math.sin(c.t * 0.35 + c.ph) * 6;
     c.y += (ty - c.y) * Math.min(1, dt * 0.6);
-    c.y = Math.min(c.y, floorAt(G2, c.x) - 30);
+    c.y = Math.min(c.y, floorAt2(G2, c.x) - 30);
     if (chance(dt * 0.4)) bubbles2(G2, c.x + c.dir * 32, c.y - 3, 1, 2, 1.1);
     if (!c.seen && inView(G2, c.x, c.y, 20)) see(G2, c, "turtle");
     if ((c.x - G2.cam.x) * c.dir > viewW2(G2) * 0.65 + 60 && c.t > 4) c.dead = true;
@@ -21782,7 +21949,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
   function updManta(G2, c, dt) {
     c.t += dt;
     c.x += c.dir * 30 * dt;
-    c.y = Math.min(c.base + Math.sin(c.t * 0.42 + c.ph) * 11, floorAt(G2, c.x) - 50);
+    c.y = Math.min(c.base + Math.sin(c.t * 0.42 + c.ph) * 11, floorAt2(G2, c.x) - 50);
     if (!c.seen && inView(G2, c.x, c.y, 30)) see(G2, c, "manta");
     if ((c.x - G2.cam.x) * c.dir > viewW2(G2) * 0.65 + 120 && c.t > 4) c.dead = true;
     if (c.t > 90) c.dead = true;
@@ -21792,7 +21959,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     const mid = raftMid(G2);
     c.x += c.dir * 26 * dt;
     const u = Math.exp(-Math.pow((c.x - mid) / 430, 2));
-    const ty = lerp(285, 150, u);
+    const ty = lerp(WHALE_DEEP, WHALE_APEX, u);
     const vy = (ty - c.y) * Math.min(1, dt * 0.5);
     c.y += vy;
     c.pitch += (clamp(vy / dt / 26 * 0.6, -0.12, 0.12) * c.dir - c.pitch) * Math.min(1, dt);
@@ -21816,6 +21983,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     c.t += dt;
     const L = G2.life;
     const fading = c.t > c.dur;
+    const lamp = lampGuarding(G2), mid = raftMid(G2), clear = raftLen2(G2) / 2 + LAMP_CLEAR;
     let alive = 0;
     for (const j of c.jellies) {
       if (j.a <= 0.01) continue;
@@ -21826,7 +21994,8 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       const sinking = fading || j.hurt;
       const target = sinking ? 12 : j.y > j.ty ? -16 * thrust - 2.5 : 3 - thrust * 6;
       j.vy += (target - j.vy) * Math.min(1, dt * 2.5);
-      j.x += (j.vx + Math.sin(c.t * 0.3 + j.ph * 0.1) * 2) * dt;
+      const shy = lamp && j.y < 240 && Math.abs(j.x - mid) < clear ? (j.x < mid ? -1 : 1) * (6 + 10 * thrust) : 0;
+      j.x += (j.vx + shy + Math.sin(c.t * 0.3 + j.ph * 0.1) * 2) * dt;
       j.y += j.vy * dt;
       j.y = Math.max(j.y, wy2(G2, j.x) + j.r + 4);
       if (sinking) j.a = Math.max(0, j.a - dt * (j.hurt ? 0.25 : 0.08));
@@ -21904,6 +22073,27 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     if (!c.seen && k > 0.5 && (visible || B.inWater && B.y < 260)) see(G2, c, "plankton");
   }
   var MW_LEN = 210;
+  var MW_LIFT0 = 0.28;
+  var MW_BELLY = 0.15;
+  var MW_KMIN = 0.85;
+  var MW_KMAX = 2;
+  var MW_LIFTMIN = 0.15;
+  var MW_LIFTMAX = 0.5;
+  var mwLen = (G2, c) => MW_LEN * unitOf2(G2) * (c.k || 1);
+  function moonBreach(G2) {
+    const cel = moonInfo(G2);
+    const v = G2.view;
+    if (!cel || !cel.moonVisible || !isFinite(cel.moonX) || !isFinite(cel.moonY) || !v) return null;
+    const L0 = MW_LEN * unitOf2(G2);
+    const hy = v.seaScreenY - 7 * v.scale;
+    const H = hy - cel.moonY;
+    const r = isFinite(cel.moonR) ? cel.moonR : 20;
+    const k = clamp(H / ((0.42 + MW_BELLY) * L0), MW_KMIN, MW_KMAX);
+    const lift = clamp(H / (k * L0) - MW_BELLY, MW_LIFTMIN, MW_LIFTMAX);
+    const reach = (lift + MW_BELLY) * k * L0;
+    const ok = H > r * 0.5 && Math.abs(reach - H) < Math.max(10, r * 0.5) && cel.moonX > r && cel.moonX < v.cssW - r;
+    return { x: cel.moonX, H, k, lift, ok };
+  }
   function horizonScreenX(G2, c, fx) {
     const v = G2.view;
     return fx * v.cssW - (G2.cam.x - c.cx0) * v.scale * 0.035;
@@ -21917,6 +22107,10 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     c.t += dt;
     const u = unitOf2(G2);
     const v = G2.view;
+    if (c.track && c.t < 3.3) {
+      const cel = moonInfo(G2);
+      if (cel && isFinite(cel.moonX) && v.cssW > 0) c.fx = (cel.moonX + (G2.cam.x - c.cx0) * v.scale * 0.035) / v.cssW;
+    }
     if (c.t > 0.4 && !c.sang) {
       c.sang = true;
       if (horizonVisible(G2)) sfx("whale");
@@ -21924,9 +22118,9 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     if (c.t > 1.2 && horizonVisible(G2) && !c.seen) see(G2, c, "moon_whale");
     const sx = horizonScreenX(G2, c, c.fx);
     const hy = v.seaScreenY - 7 * v.scale;
-    const Lw = MW_LEN * u;
-    if (c.t > 0.7 && c.t < 3.6 && chance(dt * 45)) {
-      const pose = whalePose(c, u);
+    const Lw = mwLen(G2, c);
+    if (c.t > 0.7 && c.t < 3.6 && chance(dt * 45 * Math.min(2, c.k || 1))) {
+      const pose = whalePose(c, Lw);
       const s = rand(-0.45, 0.35) * Lw;
       const py = hy - pose.h + Math.sin(pose.a) * s;
       if (py < hy - 3) c.drops.push({ x: sx + pose.x + Math.cos(pose.a) * s + rand(-0.06, 0.06) * Lw, y: py, vx: rand(-14, 14) * u, vy: rand(-10, 20) * u, life: rand(0.8, 1.6), s: rand(0.8, 1.8) * u });
@@ -21934,7 +22128,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     if (c.t > 4.85 && !c.hit) {
       c.hit = true;
       if (horizonVisible(G2)) sfx("splash");
-      const bx = sx + whalePose(c, u).x + c.side * Lw * 0.35;
+      const bx = sx + whalePose(c, Lw).x + c.side * Lw * 0.35;
       for (let i = 0; i < 110; i++) {
         const k = Math.random();
         c.drops.push({ x: bx + (k - 0.5) * 0.7 * Lw, y: hy - rand(0, 6) * u, vx: (k - 0.5) * 90 * u + rand(-15, 15) * u, vy: -rand(40, 170) * u * (1 - Math.abs(k - 0.5)), life: rand(1.2, 2.8), s: rand(0.8, 2.6) * u });
@@ -21953,9 +22147,9 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     }
     if (c.t > c.dur) c.dead = true;
   }
-  function whalePose(c, u) {
-    const Lw = MW_LEN * u;
+  function whalePose(c, Lw) {
     const t = c.t;
+    const top = Lw * (c.lift != null ? c.lift : MW_LIFT0);
     let h3, a;
     const up = -Math.PI / 2;
     if (t < 0.6) {
@@ -21963,14 +22157,14 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
       a = up + 0.1 * c.side;
     } else if (t < 2.7) {
       const p = (t - 0.6) / 2.1;
-      h3 = lerp(-Lw * 0.6, Lw * 0.28, 1 - Math.pow(1 - p, 2.2));
+      h3 = lerp(-Lw * 0.6, top, 1 - Math.pow(1 - p, 2.2));
       a = up + 0.1 * c.side;
     } else if (t < 3.3) {
-      h3 = Lw * 0.28 + Math.sin((t - 2.7) / 0.6 * Math.PI) * Lw * 0.02;
+      h3 = top + Math.sin((t - 2.7) / 0.6 * Math.PI) * Lw * 0.02;
       a = up + (0.1 + 0.25 * (t - 2.7) / 0.6) * c.side;
     } else {
       const p = Math.min(1, (t - 3.3) / 1.6);
-      h3 = lerp(Lw * 0.28, -Lw * 0.3, p * p);
+      h3 = lerp(top, -Lw * 0.3, p * p);
       a = up + lerp(0.35, 1.5, p * (2 - p)) * c.side;
     }
     const drift2 = t < 3.3 ? 0 : Math.min(1, (t - 3.3) / 1.6) * Lw * 0.22 * c.side;
@@ -22120,7 +22314,7 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
         c.y += dy / d * k;
       }
     }
-    c.y = Math.min(c.y, floorAt(G2, c.x) - 30);
+    c.y = Math.min(c.y, floorAt2(G2, c.x) - 30);
     c.y = Math.max(c.y, 60);
     if (c.lureA > 0.02) {
       addLight(G2, lx, ly, 54, [170, 255, 225], 0.9 * c.lureA);
@@ -22205,11 +22399,11 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     const B = G2.life.boy = boyInfo(G2);
     const W = viewW2(G2);
     const cx = G2.cam.x;
-    const deepY = (y) => clamp(y, 40, floorAt(G2, B.x) - 40);
+    const deepY = (y) => clamp(y, 40, floorAt2(G2, B.x) - 40);
     switch (kind) {
       case "whale": {
         const c = spawnWhale(G2, 1, cx + 170 - WHALE_L * 0.5);
-        c.y = 160;
+        c.y = WHALE_APEX + 14;
         c.seen = false;
         return true;
       }
@@ -24287,8 +24481,8 @@ body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:trans
     const v = G2.view, u = unitOf2(G2);
     const hy = v.seaScreenY - 7 * v.scale;
     const sx = horizonScreenX(G2, c, c.fx);
-    const Lw = MW_LEN * u;
-    const pose = whalePose(c, u);
+    const Lw = mwLen(G2, c);
+    const pose = whalePose(c, Lw);
     const fade = 1 - smoothstep(c.dur - 2, c.dur, c.t);
     ctx2.save();
     ctx2.beginPath();
