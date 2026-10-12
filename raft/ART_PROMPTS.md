@@ -19,11 +19,15 @@
 | `sky_night` | 夜晚的天空 | 横版 16:9 | 不透明 |
 | `horizon_day` | 白天远处海平线上的岛和礁石 | 横长条 4:1 | **透明** |
 | `horizon_night` | 夜晚远处的剪影 | 横长条 4:1 | **透明** |
-| `island` | 小岛（侧面） | 横版 3:2 | **透明** |
-| `lighthouse` | 终点的灯塔岛（侧面） | 竖版 2:3 | **透明** |
+| `island` | 小岛背后的远景（侧面） | 横版 3:2 | **透明** |
+| `lighthouse` | 终点灯塔岛背后的远景（侧面） | 竖版 2:3 | **透明** |
 | `title` | 标题画面的主视觉 | 横版 16:9 | 不透明 |
 
 天空图的**海平线要在画面从上往下大约 62% 的位置**，海平线以下的部分会被游戏里的海水盖住，画什么都行。
+
+`island` 和 `lighthouse` 两张图**只当背景用**：游戏会把它们调成带雾气的远景，铺在小岛后面；
+能走的沙滩、树、宝箱、灯塔塔身还是游戏自己画的。所以这两张图画「岛的远山和天际线」就够了，
+细节不用太多，边缘和底部会自动淡进雾里。
 
 ---
 
@@ -95,24 +99,24 @@ a broken old pier, and something unsettlingly tall and thin standing far out in 
 Low contrast, cold moonlit rim light on the top edges. Eerie but quiet. Hand-painted.
 ```
 
-## 6. 小岛 → `island`（透明背景）
+## 6. 小岛背后的远景 → `island`（透明背景）
 
 ```
-Side view of a small tropical island for a 2D side-scroller, 3:2, transparent background (PNG with alpha).
-A sandy beach on both sides sloping into the water line at the bottom, a low hill in the middle,
-three leaning palm trees, dark jungle bushes, a few rocks, an old half-buried wooden chest, driftwood.
-Daylight but moody: muted greens, warm sand, deep shadows under the trees where something could hide.
-The bottom edge is where the sea surface will be. Hand-painted gouache.
+Side view of the far backdrop of a small tropical island for a 2D side-scroller, 3:2,
+transparent background (PNG with alpha). Only the distant part: a low jungle-covered hill and a rocky
+ridge rising behind the beach, a few tall leaning palms against the sky, dark gaps in the jungle where
+something could hide. Soft, slightly hazy, muted greens and blue-grey shadows, low detail.
+No beach, no foreground objects, no people. The bottom edge fades out. Hand-painted gouache.
 ```
 
-## 7. 灯塔岛 → `lighthouse`（透明背景）
+## 7. 灯塔岛背后的远景 → `lighthouse`（透明背景）
 
 ```
-Side view of a rocky island with a tall old stone lighthouse, 2D side-scroller asset, 2:3 portrait,
-transparent background (PNG with alpha). Weathered white-and-rust stone tower with a small wooden door
-at the bottom, a warm light glowing in the lantern room at the top, a few stairs carved in the rock,
-sea birds. The bottom edge is the sea surface. Hopeful and lonely, like the end of a long journey.
-Hand-painted gouache.
+Side view of the far backdrop behind a lighthouse island, 2D side-scroller asset, 2:3 portrait,
+transparent background (PNG with alpha). Only the distant part: tall weathered sea cliffs and
+rock spires, a few wind-bent trees on the top, sea birds circling, soft haze.
+Do NOT paint the lighthouse tower itself (the game draws it in front). Low detail, the bottom edge
+fades out. Hopeful and lonely, like the end of a long journey. Hand-painted gouache.
 ```
 
 ## 8. 标题主视觉 → `title`
